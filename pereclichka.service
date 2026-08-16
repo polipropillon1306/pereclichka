@@ -1,0 +1,15 @@
+[Unit]
+Description=Telegram Rollcall Bot Service
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/pereclichka
+ExecStart=/opt/pereclichka/venv/bin/python main.py
+Restart=always
+RestartSec=10
+EnvironmentFile=/opt/pereclichka/.env
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,29 @@
+# Секреты и переменные окружения
+.env
+*.env
+service_account*.json
+credentials*.json
+*.pem
+*.key
+
+# Виртуальные окружения
+venv/
+.venv/
+env/
+ENV/
+
+# Кэш Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Локальные базы данных
+*.db
+*.sqlite3
+
+# Логи
+*.log
+
+# Редактор / IDE
+.vscode/
+.idea/
