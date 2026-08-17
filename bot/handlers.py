@@ -16,7 +16,7 @@ from config import ALLOWED_CHAT_IDS, DB_PATH
 from db import (
     register_chat, update_chat_sheet, get_chat_sheet,
     save_vote, get_votes_for_date, save_poll_message_id,
-    get_poll_message_id, get_target_date_by_message_id, set_checked_in,
+    get_poll_message_id, get_target_date_by_message_id, set_checked_in, set_checked_out,
     get_user_vote, remove_vote, get_all_dates_for_chat,
     find_user_by_identifier, get_attendance_stats, get_all_known_users_for_chat
 )
@@ -221,6 +221,8 @@ async def cmd_mark(message: Message):
     # 2. Поиск статуса с конца строки
     keywords = [
         ("не будет", "-"), ("не пришел", "-"), ("не придет", "-"), ("не смогу", "-"), ("отказ", "-"), ("-1", "-"), ("-", "-"), ("нет", "-"),
+        ("ушел", "+_checkout"), ("ушла", "+_checkout"), ("ухожу", "+_checkout"), ("уехали", "+_checkout"), ("ушли", "+_checkout"),
+        ("домой", "+_checkout"), ("закончил", "+_checkout"), ("закончила", "+_checkout"), ("смену сдал", "+_checkout"), ("сдал смену", "+_checkout"),
         ("пришел", "+_arrived"), ("прибыл", "+_arrived"), ("вышел", "+_arrived"), ("был", "+_arrived"),
         ("будет", "+"), ("придет", "+"), ("+1", "+"), ("+", "+"), ("да", "+"),
         ("del", "del"), ("delete", "del"), ("удалить", "del"), ("снять", "del"), ("0", "del"), ("отмена", "del")
@@ -240,7 +242,8 @@ async def cmd_mark(message: Message):
             "⚠️ <b>Использование команды:</b>\n"
             "<code>/mark @username +</code> — отметить «Будет»\n"
             "<code>/mark @username пришел 08:30</code> — отметить «Пришел в 08:30»\n"
-            "<code>/mark Иван Иванов пришел</code> — отметить по имени\n"
+            "<code>/mark @username ушел 18:00</code> — отметить «Ушел в 18:00»\n"
+            "<code>/mark Иван Иванов ушел</code> — отметить уход по имени\n"
             "<code>/mark @username -</code> — отметить «Не будет»\n"
             "<code>/mark @username del</code> — удалить отметку",
             parse_mode="HTML"
@@ -263,6 +266,20 @@ async def cmd_mark(message: Message):
     if status == "del":
         await remove_vote(message.chat.id, target_date, user_id)
         action_text = "отметка удалена"
+    elif status == "+_checkout":
+        if not time_arg:
+            time_arg = now.strftime("%H:%M")
+        await save_vote(
+            chat_id=message.chat.id,
+            target_date=target_date,
+            user_id=user_id,
+            username=username,
+            full_name=full_name,
+            status="+",
+            checked_in=1,
+            checkout_time=time_arg
+        )
+        action_text = f"отмечен уход со смены (ушел в {time_arg})"
     elif status.startswith("+"):
         if status == "+_arrived" and not time_arg:
             time_arg = now.strftime("%H:%M")
@@ -405,21 +422,31 @@ async def process_vote_callback(callback: CallbackQuery):
     if not target_date:
         target_date = get_current_poll_date_str()
 
-    prev_status = await get_user_vote(chat_id, target_date, user.id)
+    now = get_msk_now()
+    today_date = get_today_date_str(now)
+    is_morning_today = (target_date == today_date and 6 <= now.hour < 20)
 
-    # Если нажал ту же кнопку повторно — снимаем голос
+    # Если нажал ту же кнопку повторно — снимаем голос (кроме утреннего '+' когда подтверждается приход)
     if prev_status == status:
-        await remove_vote(chat_id, target_date, user.id)
-        new_status = None
-        ans_text = "Ваша отметка снята!"
+        if is_morning_today and status == '+':
+            new_status = '+'
+            ans_text = "Ваше присутствие подтверждено!"
+        else:
+            await remove_vote(chat_id, target_date, user.id)
+            new_status = None
+            ans_text = "Ваша отметка снята!"
     else:
+        checked_in = 1 if (is_morning_today and status == '+') else 0
+        checkin_time = now.strftime("%H:%M") if checked_in else None
         await save_vote(
             chat_id=chat_id,
             target_date=target_date,
             user_id=user.id,
             username=user.username or "",
             full_name=user.full_name or "Участник",
-            status=status
+            status=status,
+            checkin_time=checkin_time,
+            checked_in=checked_in
         )
         new_status = status
         ans_text = f"Ваш ответ '{status}' записан!"
@@ -511,8 +538,53 @@ async def handle_messages(message: Message):
                 known_users = await get_all_known_users_for_chat(chat_id)
                 await async_sync_rollcall_to_sheet(sheet_url, today_date, votes, bot=message.bot, chat_id=chat_id, known_users=known_users)
 
-    # 2. Быстрый ответ + / - / буду / не буду на опрос (текстом или в подписи к фото)
+    # 2. Фиксация времени ухода со смены (текстом или в подписи к фото)
     clean_text = text.lower().strip("!.,? \n\r")
+    checkout_keywords = [
+        "ушел", "ушла", "ухожу", "уехали", "ушли",
+        "домой", "еду домой", "поехал домой", "поехала домой", "поехали домой",
+        "закончил", "закончила", "закончили", "смену сдал", "сдал смену",
+        "все на сегодня", "всё на сегодня", "на сегодня все", "на сегодня всё"
+    ]
+    is_checkout = False
+    for kw in checkout_keywords:
+        if clean_text == kw or re.search(rf"(?:^|\s){re.escape(kw)}(?:$|\s)", clean_text):
+            is_checkout = True
+            break
+
+    if is_checkout:
+        today_date = get_today_date_str(now)
+        checkout_time = now.strftime("%H:%M")
+        await set_checked_out(
+            chat_id=chat_id,
+            target_date=today_date,
+            user_id=user.id,
+            checkout_time=checkout_time,
+            username=user.username or "",
+            full_name=user.full_name or "Участник"
+        )
+        votes = await get_votes_for_date(chat_id, today_date)
+        poll_msg_id = await get_poll_message_id(chat_id, today_date)
+        if poll_msg_id:
+            try:
+                new_text = format_poll_text(today_date, votes)
+                await message.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=poll_msg_id,
+                    text=new_text,
+                    reply_markup=get_rollcall_keyboard(),
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logger.warning(f"Не удалось обновить опрос при фиксации ухода: {e}")
+
+        sheet_url = await get_chat_sheet(chat_id)
+        if sheet_url:
+            known_users = await get_all_known_users_for_chat(chat_id)
+            await async_sync_rollcall_to_sheet(sheet_url, today_date, votes, bot=message.bot, chat_id=chat_id, known_users=known_users)
+        return
+
+    # 3. Быстрый ответ + / - / буду / не буду на опрос (текстом или в подписи к фото)
     parsed_vote = None
     if clean_text in ["+", "+1", "буду", "плюс", "приду", "я буду", "я приду"]:
         parsed_vote = "+"

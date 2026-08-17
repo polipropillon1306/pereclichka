@@ -71,13 +71,20 @@ def format_poll_text(target_date: str, votes: List[Tuple]) -> str:
         status = item[3]
         checked_in = item[4]
         checkin_time = item[5] if len(item) > 5 else None
+        checkout_time = item[6] if len(item) > 6 else None
 
         name = f"@{username}" if username else full_name
         safe_name = html.escape(name)
         if status == '+':
             if checked_in:
-                time_str = f" {checkin_time}" if checkin_time else ""
-                check_mark = f" ✅ (в чате{time_str})"
+                if checkin_time and checkout_time:
+                    check_mark = f" ✅ ({checkin_time} — {checkout_time})"
+                elif checkin_time:
+                    check_mark = f" ✅ (в чате {checkin_time})"
+                elif checkout_time:
+                    check_mark = f" ✅ (ушел в {checkout_time})"
+                else:
+                    check_mark = " ✅"
             else:
                 check_mark = ""
             going.append(f"• {safe_name}{check_mark}")

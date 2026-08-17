@@ -37,23 +37,7 @@ def normalize_key(s: str) -> str:
 def apply_conditional_formatting(spreadsheet, sheet_id: int):
     """Настраивает автоматическую подсветку статусов в Google Таблице"""
     rules = [
-        # Зеленый — Пришел
-        {
-            'addConditionalFormatRule': {
-                'rule': {
-                    'ranges': [{'sheetId': sheet_id, 'startRowIndex': 1, 'startColumnIndex': 2}],
-                    'booleanRule': {
-                        'condition': {'type': 'TEXT_CONTAINS', 'values': [{'userEnteredValue': 'Пришел'}]},
-                        'format': {
-                            'backgroundColor': {'red': 0.85, 'green': 0.92, 'blue': 0.83},
-                            'textFormat': {'foregroundColor': {'red': 0.15, 'green': 0.31, 'blue': 0.07}, 'bold': True}
-                        }
-                    }
-                },
-                'index': 0
-            }
-        },
-        # Желтый — Ожидается
+        # 1. Желтый — Ожидается
         {
             'addConditionalFormatRule': {
                 'rule': {
@@ -66,10 +50,10 @@ def apply_conditional_formatting(spreadsheet, sheet_id: int):
                         }
                     }
                 },
-                'index': 1
+                'index': 0
             }
         },
-        # Красный — Не будет
+        # 2. Красный — Не будет
         {
             'addConditionalFormatRule': {
                 'rule': {
@@ -82,10 +66,10 @@ def apply_conditional_formatting(spreadsheet, sheet_id: int):
                         }
                     }
                 },
-                'index': 2
+                'index': 1
             }
         },
-        # Серый — Не отметился
+        # 3. Серый — Не отметился
         {
             'addConditionalFormatRule': {
                 'rule': {
@@ -95,6 +79,22 @@ def apply_conditional_formatting(spreadsheet, sheet_id: int):
                         'format': {
                             'backgroundColor': {'red': 0.94, 'green': 0.94, 'blue': 0.94},
                             'textFormat': {'foregroundColor': {'red': 0.45, 'green': 0.45, 'blue': 0.45}}
+                        }
+                    }
+                },
+                'index': 2
+            }
+        },
+        # 4. Зеленый — Пришел / интервал работы / подтвержденный выход
+        {
+            'addConditionalFormatRule': {
+                'rule': {
+                    'ranges': [{'sheetId': sheet_id, 'startRowIndex': 1, 'startColumnIndex': 2}],
+                    'booleanRule': {
+                        'condition': {'type': 'TEXT_STARTS_WITH', 'values': [{'userEnteredValue': '+'}]},
+                        'format': {
+                            'backgroundColor': {'red': 0.85, 'green': 0.92, 'blue': 0.83},
+                            'textFormat': {'foregroundColor': {'red': 0.15, 'green': 0.31, 'blue': 0.07}, 'bold': True}
                         }
                     }
                 },
@@ -120,7 +120,7 @@ def get_or_create_month_worksheet(spreadsheet, target_date: str):
 
 def sync_rollcall_to_sheet(sheet_url: str, target_date: str, votes: List[Tuple], known_users: List[Tuple] = None) -> Optional[str]:
     """
-    votes: list of (user_id, username, full_name, status, checked_in, [checkin_time])
+    votes: list of (user_id, username, full_name, status, checked_in, [checkin_time], [checkout_time])
     Синхронизирует результаты переклички в Google Таблицу на вкладку месяца.
     """
     if not sheet_url:
@@ -194,11 +194,18 @@ def sync_rollcall_to_sheet(sheet_url: str, target_date: str, votes: List[Tuple],
             status = item[3]
             checked_in = item[4]
             checkin_time = item[5] if len(item) > 5 else None
+            checkout_time = item[6] if len(item) > 6 else None
 
             status_text = status
             if status == '+' and checked_in:
-                time_str = f" {checkin_time}" if checkin_time else ""
-                status_text = f"+ (Пришел{time_str})"
+                if checkin_time and checkout_time:
+                    status_text = f"+ ({checkin_time} — {checkout_time})"
+                elif checkin_time:
+                    status_text = f"+ (Пришел {checkin_time})"
+                elif checkout_time:
+                    status_text = f"+ (Ушел {checkout_time})"
+                else:
+                    status_text = "+ (Пришел)"
             elif status == '+' and not checked_in:
                 status_text = "+ (Ожидается)"
             elif status == '-':
@@ -223,7 +230,6 @@ def sync_rollcall_to_sheet(sheet_url: str, target_date: str, votes: List[Tuple],
             if found_key:
                 matched_keys.add(found_key)
                 entry["dates"][target_date] = active_votes_map[found_key][0]
-                # Обновляем имя/username если изменились
                 if active_votes_map[found_key][1]:
                     entry["name"] = active_votes_map[found_key][1]
                 if active_votes_map[found_key][2]:
@@ -256,7 +262,7 @@ def sync_rollcall_to_sheet(sheet_url: str, target_date: str, votes: List[Tuple],
         for c_idx in range(2, num_cols):
             present_count = 0
             for r in final_user_rows:
-                if len(r) > c_idx and "Пришел" in r[c_idx]:
+                if len(r) > c_idx and r[c_idx].startswith("+ (") and "Ожидается" not in r[c_idx]:
                     present_count += 1
             summary_row.append(str(present_count))
 
