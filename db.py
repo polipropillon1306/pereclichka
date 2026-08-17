@@ -254,3 +254,16 @@ async def get_attendance_stats(chat_id: int, month_year: str = None):
 
         stats_list.sort(key=lambda x: (x["attended"], x["reliability"]), reverse=True)
         return stats_list, total_dates_count
+
+async def get_all_known_users_for_chat(chat_id: int):
+    """Возвращает список всех известных участников чата (user_id, username, full_name)"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("""
+            SELECT user_id, username, full_name, MAX(id) as max_id
+            FROM rollcalls
+            WHERE chat_id = ?
+            GROUP BY user_id
+            ORDER BY max_id ASC
+        """, (chat_id,)) as cursor:
+            rows = await cursor.fetchall()
+            return [(r[0], r[1], r[2]) for r in rows]

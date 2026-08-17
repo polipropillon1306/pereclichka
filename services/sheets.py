@@ -117,7 +117,7 @@ def get_or_create_month_worksheet(spreadsheet, target_date: str):
         apply_conditional_formatting(spreadsheet, ws.id)
         return ws
 
-def sync_rollcall_to_sheet(sheet_url: str, target_date: str, votes: List[Tuple]) -> Optional[str]:
+def sync_rollcall_to_sheet(sheet_url: str, target_date: str, votes: List[Tuple], known_users: List[Tuple] = None) -> Optional[str]:
     """
     votes: list of (user_id, username, full_name, status, checked_in, [checkin_time])
     Синхронизирует результаты переклички в Google Таблицу на вкладку месяца.
@@ -139,6 +139,9 @@ def sync_rollcall_to_sheet(sheet_url: str, target_date: str, votes: List[Tuple])
         if not all_values or not all_values[0] or all_values[0][0] != "Имя участника":
             headers = ["Имя участника", "Telegram"]
             user_rows = []
+            if known_users:
+                for uid, uname, fname in known_users:
+                    user_rows.append([fname, f"@{uname}" if uname else ""])
         else:
             headers = list(all_values[0])
             user_rows = all_values[1:]
@@ -243,9 +246,9 @@ def sync_rollcall_to_sheet(sheet_url: str, target_date: str, votes: List[Tuple])
         logger.error(err_msg)
         return err_msg
 
-async def async_sync_rollcall_to_sheet(sheet_url: str, target_date: str, votes: List[Tuple], bot=None, chat_id: int = None):
+async def async_sync_rollcall_to_sheet(sheet_url: str, target_date: str, votes: List[Tuple], bot=None, chat_id: int = None, known_users: List[Tuple] = None):
     async with _sync_lock:
-        error = await asyncio.to_thread(sync_rollcall_to_sheet, sheet_url, target_date, votes)
+        error = await asyncio.to_thread(sync_rollcall_to_sheet, sheet_url, target_date, votes, known_users)
         if error and bot and chat_id:
             try:
                 await bot.send_message(

@@ -18,7 +18,7 @@ from db import (
     save_vote, get_votes_for_date, save_poll_message_id,
     get_poll_message_id, get_target_date_by_message_id, set_checked_in,
     get_user_vote, remove_vote, get_all_dates_for_chat,
-    find_user_by_identifier, get_attendance_stats
+    find_user_by_identifier, get_attendance_stats, get_all_known_users_for_chat
 )
 from services.sheets import async_sync_rollcall_to_sheet
 
@@ -96,6 +96,7 @@ async def cmd_setup_sheet(message: Message):
     
     # Синхронизация всех предыдущих дат
     dates = await get_all_dates_for_chat(message.chat.id)
+    known_users = await get_all_known_users_for_chat(message.chat.id)
     try:
         dates.sort(key=lambda d: datetime.strptime(d, "%d.%m.%Y"))
     except Exception:
@@ -105,7 +106,7 @@ async def cmd_setup_sheet(message: Message):
     for d in dates:
         votes = await get_votes_for_date(message.chat.id, d)
         if votes:
-            await async_sync_rollcall_to_sheet(sheet_url, d, votes, bot=message.bot, chat_id=message.chat.id)
+            await async_sync_rollcall_to_sheet(sheet_url, d, votes, bot=message.bot, chat_id=message.chat.id, known_users=known_users)
             synced_count += 1
 
     await status_msg.edit_text(
@@ -135,6 +136,7 @@ async def cmd_sync_sheet(message: Message):
     status_msg = await message.answer("⏳ Запущена синхронизация всех перекличек в Google Таблицу...", parse_mode="HTML")
 
     dates = await get_all_dates_for_chat(message.chat.id)
+    known_users = await get_all_known_users_for_chat(message.chat.id)
     try:
         dates.sort(key=lambda d: datetime.strptime(d, "%d.%m.%Y"))
     except Exception:
@@ -144,7 +146,7 @@ async def cmd_sync_sheet(message: Message):
     for d in dates:
         votes = await get_votes_for_date(message.chat.id, d)
         if votes:
-            await async_sync_rollcall_to_sheet(sheet_url, d, votes, bot=message.bot, chat_id=message.chat.id)
+            await async_sync_rollcall_to_sheet(sheet_url, d, votes, bot=message.bot, chat_id=message.chat.id, known_users=known_users)
             synced_count += 1
 
     await status_msg.edit_text(
@@ -195,7 +197,7 @@ async def cmd_start_poll(message: Message):
 
 @router.message(Command("mark"))
 async def cmd_mark(message: Message):
-    """Ручная отметка работника администратором: /mark @username + [время]"""
+    """Ручная отметка работника администратором: /mark @username / имя + [время]"""
     if message.chat.type == "private":
         await message.answer("⛔ <b>Команда доступна только внутри рабочей группы.</b>", parse_mode="HTML")
         return
@@ -204,45 +206,66 @@ async def cmd_mark(message: Message):
         await message.answer("⛔ <b>У вас нет прав для этой команды.</b>", parse_mode="HTML")
         return
 
-    parts = message.text.split()
-    if len(parts) < 3:
+    now = get_msk_now()
+    raw = re.sub(r"^/mark(@\w+)?\s*", "", message.text.strip(), flags=re.IGNORECASE)
+
+    # 1. Поиск времени HH:MM в конце строки (например, 08:30 или 8:30)
+    time_match = re.search(r"\b(\d{1,2}:\d{2})\s*$", raw)
+    time_arg = None
+    if time_match:
+        time_arg = time_match.group(1)
+        if len(time_arg) == 4 and time_arg[1] == ":":
+            time_arg = f"0{time_arg}"
+        raw = raw[:time_match.start()].strip()
+
+    # 2. Поиск статуса с конца строки
+    keywords = [
+        ("не будет", "-"), ("не пришел", "-"), ("не придет", "-"), ("не смогу", "-"), ("отказ", "-"), ("-1", "-"), ("-", "-"), ("нет", "-"),
+        ("пришел", "+_arrived"), ("прибыл", "+_arrived"), ("вышел", "+_arrived"), ("был", "+_arrived"),
+        ("будет", "+"), ("придет", "+"), ("+1", "+"), ("+", "+"), ("да", "+"),
+        ("del", "del"), ("delete", "del"), ("удалить", "del"), ("снять", "del"), ("0", "del"), ("отмена", "del")
+    ]
+
+    status = None
+    user_identifier = raw
+    for kw, st in keywords:
+        pattern = re.compile(rf"(?:^|\s){re.escape(kw)}\s*$", re.IGNORECASE)
+        if pattern.search(raw):
+            status = st
+            user_identifier = pattern.sub("", raw).strip("\"' ")
+            break
+
+    if not status or not user_identifier:
         await message.answer(
             "⚠️ <b>Использование команды:</b>\n"
             "<code>/mark @username +</code> — отметить «Будет»\n"
-            "<code>/mark @username + 08:30</code> — отметить «Пришел в 08:30»\n"
+            "<code>/mark @username пришел 08:30</code> — отметить «Пришел в 08:30»\n"
+            "<code>/mark Иван Иванов пришел</code> — отметить по имени\n"
             "<code>/mark @username -</code> — отметить «Не будет»\n"
             "<code>/mark @username del</code> — удалить отметку",
             parse_mode="HTML"
         )
         return
 
-    user_identifier = parts[1]
-    new_status = parts[2].lower()
-    time_arg = parts[3] if len(parts) > 3 else None
-
-    # Валидация формата времени HH:MM если передано
-    if time_arg and not re.match(r"^\d{1,2}:\d{2}$", time_arg):
-        time_arg = None
-
-    now = get_msk_now()
     target_date = get_current_poll_date_str(now)
 
     # Ищем пользователя в базе
     user_info = await find_user_by_identifier(message.chat.id, user_identifier)
     if not user_info:
-        # Если пользователя еще не было в базе, генерируем временные данные
         user_id = abs(hash(user_identifier)) % (10 ** 9)
-        username = user_identifier.lstrip("@")
-        full_name = username
+        username = user_identifier.lstrip("@") if user_identifier.startswith("@") else ""
+        full_name = user_identifier.lstrip("@")
     else:
         user_id = user_info["user_id"]
         username = user_info["username"]
         full_name = user_info["full_name"]
 
-    if new_status in ["del", "delete", "снять", "0"]:
+    if status == "del":
         await remove_vote(message.chat.id, target_date, user_id)
         action_text = "отметка удалена"
-    elif new_status in ["+", "+1", "будет", "пришел"]:
+    elif status.startswith("+"):
+        if status == "+_arrived" and not time_arg:
+            time_arg = now.strftime("%H:%M")
         checked_in = 1 if time_arg else 0
         await save_vote(
             chat_id=message.chat.id,
@@ -255,7 +278,7 @@ async def cmd_mark(message: Message):
             checked_in=checked_in
         )
         action_text = f"отмечен как «Будет»{' (пришел в ' + time_arg + ')' if time_arg else ''}"
-    elif new_status in ["-", "-1", "не будет", "отказ"]:
+    elif status == "-":
         await save_vote(
             chat_id=message.chat.id,
             target_date=target_date,
@@ -265,9 +288,6 @@ async def cmd_mark(message: Message):
             status="-"
         )
         action_text = "отмечен как «Не будет»"
-    else:
-        await message.answer("⚠️ Неизвестный статус. Используйте <code>+</code>, <code>-</code> или <code>del</code>", parse_mode="HTML")
-        return
 
     # Обновляем опрос в чате
     votes = await get_votes_for_date(message.chat.id, target_date)
@@ -288,14 +308,15 @@ async def cmd_mark(message: Message):
     # Синхронизация с таблицей
     sheet_url = await get_chat_sheet(message.chat.id)
     if sheet_url:
-        await async_sync_rollcall_to_sheet(sheet_url, target_date, votes, bot=message.bot, chat_id=message.chat.id)
+        known_users = await get_all_known_users_for_chat(message.chat.id)
+        await async_sync_rollcall_to_sheet(sheet_url, target_date, votes, bot=message.bot, chat_id=message.chat.id, known_users=known_users)
 
     name_display = f"@{username}" if username else full_name
     await message.answer(f"✅ Для <b>{html.escape(name_display)}</b> на дату <b>{target_date}</b> {action_text}.", parse_mode="HTML")
 
 @router.message(Command("stats"))
 async def cmd_stats(message: Message):
-    """Сводная статистика посещаемости: /stats или /stats 08.2026"""
+    """Сводная статистика посещаемости: /stats, /stats 08.2026, /stats 8, /stats август, /stats все"""
     if message.chat.type == "private":
         await message.answer("⛔ <b>Статистика доступна только внутри рабочей группы.</b>", parse_mode="HTML")
         return
@@ -304,18 +325,44 @@ async def cmd_stats(message: Message):
         await message.answer("⛔ <b>У вас нет прав для просмотра статистики.</b>", parse_mode="HTML")
         return
 
+    now = get_msk_now()
     args = message.text.split(maxsplit=1)
+    
     if len(args) > 1 and args[1].strip():
-        period_arg = args[1].strip()
-        # Проверяем формат MM.YYYY
-        if re.match(r"^\d{2}\.\d{4}$", period_arg):
-            month_year = period_arg
-            period_name = period_arg
-        else:
+        clean_arg = args[1].strip().lower()
+        if clean_arg in ["все", "всё", "all", "total", "весь"]:
             month_year = None
-            period_name = period_arg
+            period_name = "за все время"
+        else:
+            m = re.match(r"^(\d{1,2})\.(\d{4})$", clean_arg)
+            if m:
+                month_num = int(m.group(1))
+                year_num = int(m.group(2))
+                month_year = f"{month_num:02d}.{year_num}"
+                period_name = month_year
+            else:
+                month_dict = {
+                    "1": 1, "01": 1, "янв": 1, "январь": 1,
+                    "2": 2, "02": 2, "фев": 2, "февраль": 2,
+                    "3": 3, "03": 3, "мар": 3, "март": 3,
+                    "4": 4, "04": 4, "апр": 4, "апрель": 4,
+                    "5": 5, "05": 5, "май": 5,
+                    "6": 6, "06": 6, "июн": 6, "июнь": 6,
+                    "7": 7, "07": 7, "июл": 7, "июль": 7,
+                    "8": 8, "08": 8, "авг": 8, "август": 8,
+                    "9": 9, "09": 9, "сен": 9, "сентябрь": 9,
+                    "10": 10, "окт": 10, "октябрь": 10,
+                    "11": 11, "ноя": 11, "ноябрь": 11,
+                    "12": 12, "дек": 12, "декабрь": 12
+                }
+                if clean_arg in month_dict:
+                    m_num = month_dict[clean_arg]
+                    month_year = f"{m_num:02d}.{now.year}"
+                    period_name = month_year
+                else:
+                    month_year = None
+                    period_name = f"за все время (фильтр '{args[1].strip()}')"
     else:
-        now = get_msk_now()
         month_year = now.strftime("%m.%Y")
         period_name = f"{now.strftime('%m.%Y')} (текущий месяц)"
 
@@ -390,7 +437,8 @@ async def process_vote_callback(callback: CallbackQuery):
     # Синхронизация с Google Sheets
     sheet_url = await get_chat_sheet(chat_id)
     if sheet_url:
-        await async_sync_rollcall_to_sheet(sheet_url, target_date, votes, bot=callback.message.bot, chat_id=chat_id)
+        known_users = await get_all_known_users_for_chat(chat_id)
+        await async_sync_rollcall_to_sheet(sheet_url, target_date, votes, bot=callback.message.bot, chat_id=chat_id, known_users=known_users)
 
     # Если утром снял отметку (было '+', стало '-' или снято вовсе), спрашиваем причину
     now = get_msk_now()
@@ -444,8 +492,8 @@ async def handle_messages(message: Message):
             "• /start_poll — Запустить опрос вручную\n"
             "• /setup_sheet &lt;URL&gt; — Привязать Google Таблицу\n"
             "• /sync_sheet — Синхронизировать историю в таблицу\n"
-            "• /mark &lt;@user&gt; &lt;+|-|del&gt; [время] — Корректировка статуса\n"
-            "• /stats — Статистика посещаемости",
+            "• /mark &lt;@user|имя&gt; &lt;+|-|del&gt; [время] — Корректировка статуса\n"
+            "• /stats [месяц] — Статистика посещаемости",
             parse_mode="HTML"
         )
         return
@@ -460,7 +508,8 @@ async def handle_messages(message: Message):
             sheet_url = await get_chat_sheet(chat_id)
             if sheet_url:
                 votes = await get_votes_for_date(chat_id, today_date)
-                await async_sync_rollcall_to_sheet(sheet_url, today_date, votes, bot=message.bot, chat_id=chat_id)
+                known_users = await get_all_known_users_for_chat(chat_id)
+                await async_sync_rollcall_to_sheet(sheet_url, today_date, votes, bot=message.bot, chat_id=chat_id, known_users=known_users)
 
     # 2. Быстрый ответ + / - / буду / не буду на опрос (текстом или в подписи к фото)
     clean_text = text.lower().strip("!.,? \n\r")
@@ -514,7 +563,8 @@ async def handle_messages(message: Message):
         # Синхронизация с Google Sheets
         sheet_url = await get_chat_sheet(chat_id)
         if sheet_url:
-            await async_sync_rollcall_to_sheet(sheet_url, target_date, votes, bot=message.bot, chat_id=chat_id)
+            known_users = await get_all_known_users_for_chat(chat_id)
+            await async_sync_rollcall_to_sheet(sheet_url, target_date, votes, bot=message.bot, chat_id=chat_id, known_users=known_users)
 
         # Если утром снял отметку (было '+', стало '-' или снято вовсе), спрашиваем причину
         today_date = get_today_date_str(now)
