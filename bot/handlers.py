@@ -10,7 +10,7 @@ from bot.utils import (
     get_msk_now, get_target_date_str, get_today_date_str,
     get_current_poll_date_str, format_poll_text
 )
-from bot.filters import is_admin, is_allowed_chat
+from bot.filters import is_admin
 from config import ALLOWED_CHAT_IDS
 from db import (
     register_chat, update_chat_sheet, get_chat_sheet,
