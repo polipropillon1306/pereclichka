@@ -26,6 +26,18 @@ def get_today_date_str(now: datetime = None) -> str:
         now = get_msk_now()
     return now.strftime("%d.%m.%Y")
 
+def get_current_poll_date_str(now: datetime = None) -> str:
+    """
+    Возвращает дату текущего актуального опроса:
+    - С 00:00 до 20:00 актуален опрос на СЕГОДНЯ.
+    - С 20:00 до 23:59 актуален опрос на ЗАВТРА.
+    """
+    if now is None:
+        now = get_msk_now()
+    if now.hour < 20:
+        return get_today_date_str(now)
+    return get_target_date_str(now)
+
 def format_poll_text(target_date: str, votes: List[Tuple]) -> str:
     """
     Формирует красивый HTML текст сообщения с перекличкой
@@ -43,7 +55,7 @@ def format_poll_text(target_date: str, votes: List[Tuple]) -> str:
         elif status == '-':
             not_going.append(f"• {safe_name}")
 
-    text = f"📋 <b>ПЕРЕКЛИЧКА НА ЗАВТРА ({target_date})</b>\n"
+    text = f"📋 <b>ПЕРЕКЛИЧКА НА {target_date}</b>\n"
     text += "Кто будет на работе / в офисе?\n\n"
 
     text += f"✅ <b>Будут ({len(going)}):</b>\n"

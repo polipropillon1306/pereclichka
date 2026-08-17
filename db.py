@@ -72,17 +72,19 @@ async def save_vote(chat_id: int, target_date: str, user_id: int, username: str,
             ON CONFLICT(chat_id, target_date, user_id) DO UPDATE SET
                 status = excluded.status,
                 username = excluded.username,
-                full_name = excluded.full_name
+                full_name = excluded.full_name,
+                checked_in = CASE WHEN excluded.status = '+' THEN checked_in ELSE 0 END
         """, (chat_id, target_date, user_id, username, full_name, status))
         await db.commit()
 
-async def set_checked_in(chat_id: int, target_date: str, user_id: int):
+async def set_checked_in(chat_id: int, target_date: str, user_id: int) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
+        cursor = await db.execute("""
             UPDATE rollcalls SET checked_in = 1
-            WHERE chat_id = ? AND target_date = ? AND user_id = ? AND status = '+'
+            WHERE chat_id = ? AND target_date = ? AND user_id = ? AND status = '+' AND checked_in = 0
         """, (chat_id, target_date, user_id))
         await db.commit()
+        return cursor.rowcount > 0
 
 async def get_votes_for_date(chat_id: int, target_date: str):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -113,4 +115,21 @@ async def get_target_date_by_message_id(chat_id: int, message_id: int):
         async with db.execute("SELECT target_date FROM poll_messages WHERE chat_id = ? AND message_id = ?", (chat_id, message_id)) as cursor:
             row = await cursor.fetchone()
             return row[0] if row else None
+
+async def get_user_vote(chat_id: int, target_date: str, user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("""
+            SELECT status FROM rollcalls
+            WHERE chat_id = ? AND target_date = ? AND user_id = ?
+        """, (chat_id, target_date, user_id)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else None
+
+async def remove_vote(chat_id: int, target_date: str, user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            DELETE FROM rollcalls
+            WHERE chat_id = ? AND target_date = ? AND user_id = ?
+        """, (chat_id, target_date, user_id))
+        await db.commit()
 

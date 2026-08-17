@@ -58,7 +58,7 @@ async def check_morning_attendance(bot: Bot):
             votes = await get_votes_for_date(chat_id, today_date)
             # Фильтруем тех, кто проголосовал '+', но checked_in == 0
             missing_users = [
-                f"@{html.escape(username)}" if username else html.escape(full_name)
+                f"@{html.escape(username)}" if username else f'<a href="tg://user?id={user_id}">{html.escape(full_name or "Участник")}</a>'
                 for user_id, username, full_name, status, checked_in in votes
                 if status == '+' and not checked_in
             ]
