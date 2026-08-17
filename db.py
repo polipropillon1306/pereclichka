@@ -249,10 +249,11 @@ async def get_attendance_stats(chat_id: int, month_year: str = None):
         stats_list = list(user_stats.values())
         for s in stats_list:
             planned = s["attended"] + s["expected"]
-            s["reliability"] = round((s["attended"] / planned * 100)) if planned > 0 else 0
+            s["planned"] = planned
+            s["reliability"] = round((s["attended"] / planned * 100)) if planned > 0 else None
             s["unmarked"] = max(0, total_dates_count - s["total_votes"])
 
-        stats_list.sort(key=lambda x: (x["attended"], x["reliability"]), reverse=True)
+        stats_list.sort(key=lambda x: (x["attended"], x["reliability"] if x["reliability"] is not None else -1), reverse=True)
         return stats_list, total_dates_count
 
 async def get_all_known_users_for_chat(chat_id: int):

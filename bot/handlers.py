@@ -528,19 +528,29 @@ async def handle_messages(message: Message):
             target_date = get_current_poll_date_str(now)
 
         prev_status = await get_user_vote(chat_id, target_date, user.id)
+        today_date = get_today_date_str(now)
+        is_morning_today = (target_date == today_date and 6 <= now.hour < 20)
 
-        # Если отправил тот же знак повторно — снимаем голос
+        # Если отправил тот же знак повторно:
+        # Утром (06:00-20:00) отправка '+' подтверждает приход, а НЕ снимает голос!
         if prev_status == parsed_vote:
-            await remove_vote(chat_id, target_date, user.id)
-            new_status = None
+            if is_morning_today and parsed_vote == '+':
+                new_status = '+'
+            else:
+                await remove_vote(chat_id, target_date, user.id)
+                new_status = None
         else:
+            checked_in = 1 if (is_morning_today and parsed_vote == '+') else 0
+            checkin_time = now.strftime("%H:%M") if checked_in else None
             await save_vote(
                 chat_id=chat_id,
                 target_date=target_date,
                 user_id=user.id,
                 username=user.username or "",
                 full_name=user.full_name or "Участник",
-                status=parsed_vote
+                status=parsed_vote,
+                checkin_time=checkin_time,
+                checked_in=checked_in
             )
             new_status = parsed_vote
 

@@ -117,13 +117,14 @@ def format_stats_text(stats_list: list, total_dates: int, period_name: str) -> s
         user_name = f"@{s['username']}" if s['username'] else s['full_name']
         safe_name = html.escape(user_name)
 
+        rel_text = f"<b>{s['reliability']}%</b>" if s["reliability"] is not None else "<i>–</i>"
         text += (
             f"{medal} <b>{safe_name}</b>\n"
             f"   • Вышел на смену: <b>{s['attended']}</b>\n"
             f"   • Ожидался (не подтвердил): <b>{s['expected']}</b>\n"
             f"   • Отказался: <b>{s['not_going']}</b>\n"
             f"   • Пропустил опрос: <b>{s['unmarked']}</b>\n"
-            f"   • Надежность выхода: <b>{s['reliability']}%</b>\n\n"
+            f"   • Надежность выхода: {rel_text}\n\n"
         )
 
     return text

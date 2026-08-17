@@ -1,6 +1,7 @@
 import os
 import logging
 import asyncio
+from datetime import datetime
 from typing import List, Tuple, Optional
 import gspread
 import google.auth
@@ -149,24 +150,42 @@ def sync_rollcall_to_sheet(sheet_url: str, target_date: str, votes: List[Tuple],
         # Исключаем любые строки «ИТОГО ВЫШЛО» из списка участников
         user_rows = [r for r in user_rows if not (len(r) > 0 and "ИТОГО" in r[0].upper())]
 
-        # 2. Добавляем колонку с датой, если ее еще нет
-        if target_date not in headers:
-            headers.append(target_date)
+        # 2. Формируем отсортированный по календарю список дат
+        existing_date_headers = list(headers[2:])
+        date_headers = list(dict.fromkeys(existing_date_headers))
+        if target_date not in date_headers:
+            date_headers.append(target_date)
 
-        date_col_idx = headers.index(target_date)
-        num_cols = len(headers)
+        def parse_date_key(d_str):
+            try:
+                return datetime.strptime(d_str.strip(), "%d.%m.%Y")
+            except Exception:
+                return datetime.max
 
-        # 3. Индексируем существующих участников
+        date_headers.sort(key=parse_date_key)
+        new_headers = ["Имя участника", "Telegram"] + date_headers
+        num_cols = len(new_headers)
+
+        # 3. Индексируем существующих участников и их историю по датам
+        user_date_data = []
         user_row_map = {}
         for idx, row in enumerate(user_rows):
             name = row[0] if len(row) > 0 else ""
             username = row[1] if len(row) > 1 else ""
+            d_vals = {}
+            for col_i, d in enumerate(existing_date_headers, start=2):
+                if col_i < len(row):
+                    d_vals[d] = row[col_i]
+            
+            entry = {"name": name, "username": username, "dates": d_vals}
+            user_date_data.append(entry)
+            
             if username:
                 user_row_map[normalize_key(username)] = idx
             if name:
                 user_row_map[normalize_key(name)] = idx
 
-        # 4. Формируем маппинг активных голосов
+        # 4. Формируем маппинг активных голосов за целевую дату
         active_votes_map = {}
         for item in votes:
             user_id = item[0]
@@ -186,20 +205,14 @@ def sync_rollcall_to_sheet(sheet_url: str, target_date: str, votes: List[Tuple],
                 status_text = "- (Не будет)"
 
             cell_value = status_text
-            
             key = normalize_key(username) if username else normalize_key(full_name)
             active_votes_map[key] = (cell_value, full_name, username)
 
         # 5. Обновляем строки существующих пользователей
         matched_keys = set()
-        for idx, row in enumerate(user_rows):
-            while len(row) < num_cols:
-                row.append("Не отметился")
-
-            name = row[0] if len(row) > 0 else ""
-            username = row[1] if len(row) > 1 else ""
-            u_key = normalize_key(username) if username else None
-            n_key = normalize_key(name) if name else None
+        for idx, entry in enumerate(user_date_data):
+            u_key = normalize_key(entry["username"]) if entry["username"] else None
+            n_key = normalize_key(entry["name"]) if entry["name"] else None
 
             found_key = None
             if u_key and u_key in active_votes_map:
@@ -209,35 +222,48 @@ def sync_rollcall_to_sheet(sheet_url: str, target_date: str, votes: List[Tuple],
 
             if found_key:
                 matched_keys.add(found_key)
-                row[date_col_idx] = active_votes_map[found_key][0]
+                entry["dates"][target_date] = active_votes_map[found_key][0]
+                # Обновляем имя/username если изменились
+                if active_votes_map[found_key][1]:
+                    entry["name"] = active_votes_map[found_key][1]
+                if active_votes_map[found_key][2]:
+                    entry["username"] = f"@{active_votes_map[found_key][2]}"
             else:
-                row[date_col_idx] = "Не отметился"
+                if target_date not in entry["dates"]:
+                    entry["dates"][target_date] = "Не отметился"
 
-            user_rows[idx] = row
-
-        # 6. Добавляем новых участников
+        # 6. Добавляем новых участников, которых еще не было в таблице
         for key, (cell_value, full_name, username) in active_votes_map.items():
             if key not in matched_keys:
-                new_row = [full_name, f"@{username}" if username else ""]
-                while len(new_row) < num_cols:
-                    new_row.append("Не отметился")
-                new_row[date_col_idx] = cell_value
-                user_rows.append(new_row)
+                new_entry = {
+                    "name": full_name,
+                    "username": f"@{username}" if username else "",
+                    "dates": {target_date: cell_value}
+                }
+                user_date_data.append(new_entry)
                 matched_keys.add(key)
 
-        # 7. Формируем строку «ИТОГО ВЫШЛО» (подсчет числа вышедших на каждую дату)
+        # 7. Формируем строки участников в правильном порядке столбцов
+        final_user_rows = []
+        for entry in user_date_data:
+            row = [entry["name"], entry["username"]]
+            for d in date_headers:
+                row.append(entry["dates"].get(d, "Не отметился"))
+            final_user_rows.append(row)
+
+        # 8. Формируем строку «ИТОГО ВЫШЛО» (подсчет числа вышедших на каждую дату)
         summary_row = ["ИТОГО ВЫШЛО", ""]
         for c_idx in range(2, num_cols):
             present_count = 0
-            for r in user_rows:
+            for r in final_user_rows:
                 if len(r) > c_idx and "Пришел" in r[c_idx]:
                     present_count += 1
             summary_row.append(str(present_count))
 
-        # 8. Собираем итоговую матрицу
-        final_matrix = [headers] + user_rows + [summary_row]
+        # 9. Собираем итоговую матрицу
+        final_matrix = [new_headers] + final_user_rows + [summary_row]
 
-        # 9. Записываем ВСЮ таблицу за 1 пакетный запрос как чистый текст (RAW)
+        # 10. Записываем ВСЮ таблицу за 1 пакетный запрос как чистый текст (RAW)
         worksheet.update(final_matrix, "A1", value_input_option="RAW")
         logger.info(f"Успешно синхронизировано в Google Sheets (лист {worksheet.title}) для даты {target_date}")
         return None
