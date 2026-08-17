@@ -422,6 +422,8 @@ async def process_vote_callback(callback: CallbackQuery):
     if not target_date:
         target_date = get_current_poll_date_str()
 
+    prev_status = await get_user_vote(chat_id, target_date, user.id)
+
     now = get_msk_now()
     today_date = get_today_date_str(now)
     is_morning_today = (target_date == today_date and 6 <= now.hour < 20)
