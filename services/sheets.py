@@ -3,6 +3,7 @@ import logging
 import asyncio
 from typing import List, Tuple
 import gspread
+import google.auth
 from google.oauth2.service_account import Credentials
 from config import GOOGLE_SERVICE_ACCOUNT_FILE
 
@@ -14,11 +15,11 @@ SCOPES = [
 ]
 
 def get_gspread_client():
-    if not os.path.exists(GOOGLE_SERVICE_ACCOUNT_FILE):
-        logger.warning(f"Файл ключа Google {GOOGLE_SERVICE_ACCOUNT_FILE} не найден.")
-        return None
     try:
-        creds = Credentials.from_service_account_file(GOOGLE_SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+        if os.path.exists(GOOGLE_SERVICE_ACCOUNT_FILE):
+            creds = Credentials.from_service_account_file(GOOGLE_SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+        else:
+            creds, _ = google.auth.default(scopes=SCOPES)
         client = gspread.authorize(creds)
         return client
     except Exception as e:
