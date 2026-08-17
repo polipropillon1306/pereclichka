@@ -2,28 +2,85 @@ import html
 import logging
 import re
 from datetime import datetime
-from aiogram import Router, F
+from typing import Callable, Dict, Any, Awaitable
+from aiogram import Router, F, BaseMiddleware
 from aiogram.filters import Command
 from aiogram.filters.chat_member_updated import ChatMemberUpdatedFilter, MEMBER, ADMINISTRATOR
-from aiogram.types import Message, CallbackQuery, ChatMemberUpdated, FSInputFile
+from aiogram.types import Message, CallbackQuery, ChatMemberUpdated, FSInputFile, TelegramObject
 from bot.keyboards import get_rollcall_keyboard
 from bot.utils import (
     get_msk_now, get_target_date_str, get_today_date_str,
     get_current_poll_date_str, format_poll_text, format_stats_text
 )
-from bot.filters import is_admin
-from config import ALLOWED_CHAT_IDS, DB_PATH
+from bot.filters import is_admin, is_superadmin
+from config import ALLOWED_CHAT_IDS, DB_PATH, SUPERADMIN_ID
 from db import (
     register_chat, update_chat_sheet, get_chat_sheet,
     save_vote, get_votes_for_date, save_poll_message_id,
     get_poll_message_id, get_target_date_by_message_id, set_checked_in, set_checked_out,
     get_user_vote, remove_vote, get_all_dates_for_chat,
-    find_user_by_identifier, get_attendance_stats, get_all_known_users_for_chat
+    find_user_by_identifier, get_attendance_stats, get_all_known_users_for_chat,
+    log_private_message, get_private_logs, get_unique_pm_users, clear_private_logs
 )
 from services.sheets import async_sync_rollcall_to_sheet
 
 router = Router()
 logger = logging.getLogger(__name__)
+
+class PMLoggingMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any]
+    ) -> Any:
+        if isinstance(event, Message):
+            user = event.from_user
+            chat = event.chat
+            if user and (chat.type == "private" or (chat.type in ["group", "supergroup"] and chat.id not in ALLOWED_CHAT_IDS)):
+                text = (event.text or event.caption or f"[{event.content_type}]").strip()
+                now_str = get_msk_now().strftime("%d.%m.%Y %H:%M:%S")
+
+                # 1. Запись в SQLite
+                try:
+                    await log_private_message(
+                        user_id=user.id,
+                        username=user.username or "",
+                        full_name=user.full_name or "",
+                        text=text,
+                        chat_type=chat.type,
+                        created_at=now_str
+                    )
+                except Exception as e:
+                    logger.error(f"Ошибка сохранения лога ЛС: {e}")
+
+                # 2. Логирование в консоль
+                logger.info(f"[AUDIT] {chat.type} msg from {user.id} (@{user.username} - {user.full_name}): {text}")
+
+                # 3. Мгновенное оповещение суперадмина
+                if user.id != SUPERADMIN_ID and not text.startswith("/audit") and not text.startswith("/pm_logs"):
+                    try:
+                        alert_text = (
+                            "🔔 <b>Обращение к боту вне рабочей группы!</b>\n\n"
+                            f"👤 <b>Пользователь:</b> {html.escape(user.full_name or 'Без имени')} "
+                            f"({'@' + user.username if user.username else 'нет username'})\n"
+                            f"🆔 <b>ID:</b> <code>{user.id}</code>\n"
+                            f"📍 <b>Тип чата:</b> {chat.type}\n"
+                            f"💬 <b>Сообщение:</b> <code>{html.escape(text[:300])}</code>\n"
+                            f"🕒 <b>Время:</b> {now_str} (МСК)"
+                        )
+                        await event.bot.send_message(
+                            chat_id=SUPERADMIN_ID,
+                            text=alert_text,
+                            parse_mode="HTML"
+                        )
+                    except Exception as e:
+                        logger.warning(f"Не удалось отправить алерт суперадмину {SUPERADMIN_ID}: {e}")
+
+        return await handler(event, data)
+
+router.message.outer_middleware(PMLoggingMiddleware())
+
 
 @router.my_chat_member(ChatMemberUpdatedFilter(member_status_changed=(MEMBER | ADMINISTRATOR)))
 async def on_bot_added_to_chat(event: ChatMemberUpdated):
@@ -406,6 +463,63 @@ async def cmd_backup(message: Message):
     except Exception as e:
         logger.error(f"Ошибка создания бэкапа: {e}")
         await message.answer("⚠️ Не удалось отправить резервную копию базы данных.", parse_mode="HTML")
+
+@router.message(Command("audit", "pm_logs"))
+async def cmd_audit(message: Message):
+    """Просмотр журнала обращений к боту вне группы (только для SuperAdmin)"""
+    if not message.from_user or not is_superadmin(message.from_user.id):
+        await message.answer("⛔ <b>У вас нет прав для доступа к аудиту.</b>", parse_mode="HTML")
+        return
+
+    args = message.text.split(maxsplit=1)
+    subcmd = args[1].strip().lower() if len(args) > 1 else "logs"
+
+    if subcmd in ["clear", "очистить", "reset"]:
+        await clear_private_logs()
+        await message.answer("🗑️ <b>Журнал обращений вне группы успешно очищен.</b>", parse_mode="HTML")
+        return
+
+    if subcmd in ["users", "пользователи", "люди"]:
+        users = await get_unique_pm_users()
+        if not users:
+            await message.answer("ℹ️ <b>В журнале пока нет обращений от пользователей.</b>", parse_mode="HTML")
+            return
+
+        lines = [f"👥 <b>Пользователи, писавшие боту в ЛС ({len(users)}):</b>\n"]
+        for idx, (uid, uname, fname, count, last_seen) in enumerate(users, 1):
+            u_display = f"@{uname}" if uname else f"ID: {uid}"
+            f_display = html.escape(fname or "Без имени")
+            lines.append(
+                f"{idx}. <b>{f_display}</b> ({u_display}) [<code>{uid}</code>]\n"
+                f"   • Сообщений: <b>{count}</b>\n"
+                f"   • Посл. активность: <code>{last_seen}</code>"
+            )
+        lines.append("\n<i>Для детального списка сообщений используйте <code>/audit</code>.</i>")
+        await message.answer("\n".join(lines), parse_mode="HTML")
+        return
+
+    # По умолчанию — список последних сообщений
+    limit = 25
+    if subcmd.isdigit():
+        limit = min(100, max(1, int(subcmd)))
+
+    logs = await get_private_logs(limit=limit)
+    if not logs:
+        await message.answer("ℹ️ <b>Журнал обращений вне группы пуст.</b>", parse_mode="HTML")
+        return
+
+    lines = [f"🕵️ <b>Журнал обращений вне группы (последние {len(logs)}):</b>\n"]
+    for log_id, uid, uname, fname, text, chat_type, created_at in logs:
+        u_display = f"@{uname}" if uname else "нет username"
+        f_display = html.escape(fname or "Без имени")
+        escaped_text = html.escape(text) if text else "<i>[пусто]</i>"
+        lines.append(
+            f"• <b>{created_at}</b> — <b>{f_display}</b> ({u_display}) [<code>{uid}</code>]:\n"
+            f"  💬 <code>{escaped_text}</code>"
+        )
+    lines.append("\n<i>Команды управления:</i>\n• <code>/audit users</code> — список уникальных пользователей\n• <code>/audit 50</code> — показать 50 записей\n• <code>/audit clear</code> — очистить журнал")
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
 
 @router.callback_query(F.data.startswith("vote_"))
 async def process_vote_callback(callback: CallbackQuery):

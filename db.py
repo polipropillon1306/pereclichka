@@ -53,11 +53,25 @@ async def init_db():
                 PRIMARY KEY (chat_id, target_date)
             )
         """)
+
+        # Журнал обращений в личные сообщения / аудит
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS private_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                username TEXT,
+                full_name TEXT,
+                text TEXT,
+                chat_type TEXT,
+                created_at TEXT
+            )
+        """)
         await db.commit()
 
 async def register_chat(chat_id: int):
     if chat_id not in ALLOWED_CHAT_IDS:
         return
+
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("INSERT OR IGNORE INTO chats (chat_id) VALUES (?)", (chat_id,))
         await db.commit()
@@ -300,3 +314,44 @@ async def get_all_known_users_for_chat(chat_id: int):
         """, (chat_id,)) as cursor:
             rows = await cursor.fetchall()
             return [(r[0], r[1], r[2]) for r in rows]
+
+async def log_private_message(user_id: int, username: str, full_name: str, text: str, chat_type: str = "private", created_at: str = None):
+    """Сохраняет обращение к боту в ЛС или неразрешенном чате"""
+    if created_at is None:
+        from bot.utils import get_msk_now
+        created_at = get_msk_now().strftime("%d.%m.%Y %H:%M:%S")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO private_logs (user_id, username, full_name, text, chat_type, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (user_id, username or "", full_name or "", text or "", chat_type or "private", created_at))
+        await db.commit()
+
+async def get_private_logs(limit: int = 30):
+    """Возвращает последние записи обращений в ЛС"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("""
+            SELECT id, user_id, username, full_name, text, chat_type, created_at
+            FROM private_logs
+            ORDER BY id DESC
+            LIMIT ?
+        """, (limit,)) as cursor:
+            return await cursor.fetchall()
+
+async def get_unique_pm_users():
+    """Возвращает список уникальных пользователей, писавших боту в ЛС"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("""
+            SELECT user_id, username, full_name, COUNT(id) as msg_count, MAX(created_at) as last_seen
+            FROM private_logs
+            GROUP BY user_id
+            ORDER BY MAX(id) DESC
+        """) as cursor:
+            return await cursor.fetchall()
+
+async def clear_private_logs():
+    """Очищает журнал обращений в ЛС"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM private_logs")
+        await db.commit()
+

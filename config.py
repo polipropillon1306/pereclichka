@@ -22,8 +22,12 @@ ADMIN_IDS = [
     int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()
 ]
 
+# Главный администратор с исключительными правами аудита
+SUPERADMIN_ID = int(os.getenv("SUPERADMIN_ID", "7779352589"))
+
 # Разрешенные группы/чаты для работы бота
 _raw_allowed = os.getenv("ALLOWED_CHAT_IDS", "").split(",")
 ALLOWED_CHAT_IDS = [
     int(x.strip()) for x in _raw_allowed if x.strip().lstrip("-").isdigit()
 ]
+

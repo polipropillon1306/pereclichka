@@ -1,10 +1,16 @@
-from config import ADMIN_IDS, ALLOWED_CHAT_IDS
+from config import ADMIN_IDS, ALLOWED_CHAT_IDS, SUPERADMIN_ID
 
 def is_admin(user_id: int) -> bool:
     """
     Проверяет, входит ли ID пользователя в список разрешенных администраторов
     """
     return user_id in ADMIN_IDS
+
+def is_superadmin(user_id: int) -> bool:
+    """
+    Проверяет, является ли пользователь главным администратором (аудит, логи)
+    """
+    return user_id == SUPERADMIN_ID
 
 def is_allowed_chat(chat_id: int) -> bool:
     """
@@ -14,3 +20,4 @@ def is_allowed_chat(chat_id: int) -> bool:
         # Личные сообщения разрешены только для админов
         return chat_id in ADMIN_IDS
     return chat_id in ALLOWED_CHAT_IDS
+
