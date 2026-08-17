@@ -183,7 +183,7 @@ def sync_rollcall_to_sheet(sheet_url: str, target_date: str, votes: List[Tuple])
             elif status == '-':
                 status_text = "- (Не будет)"
 
-            cell_value = f"'{status_text}" if status_text.startswith(('+', '-', '=')) else status_text
+            cell_value = status_text
             
             key = normalize_key(username) if username else normalize_key(full_name)
             active_votes_map[key] = (cell_value, full_name, username)
@@ -235,8 +235,8 @@ def sync_rollcall_to_sheet(sheet_url: str, target_date: str, votes: List[Tuple])
         # 8. Собираем итоговую матрицу
         final_matrix = [headers] + user_rows + [summary_row]
 
-        # 9. Записываем ВСЮ таблицу за 1 пакетный запрос с автоматической интерпретацией текста
-        worksheet.update(final_matrix, "A1", value_input_option="USER_ENTERED")
+        # 9. Записываем ВСЮ таблицу за 1 пакетный запрос как чистый текст (RAW)
+        worksheet.update(final_matrix, "A1", value_input_option="RAW")
         logger.info(f"Успешно синхронизировано в Google Sheets (лист {worksheet.title}) для даты {target_date}")
         return None
     except Exception as e:
