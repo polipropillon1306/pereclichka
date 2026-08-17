@@ -4,6 +4,7 @@ from aiogram import Router, F
 from aiogram.filters import Command
 from aiogram.filters.chat_member_updated import ChatMemberUpdatedFilter, MEMBER, ADMINISTRATOR
 from aiogram.types import Message, CallbackQuery, ChatMemberUpdated
+from datetime import datetime
 from bot.keyboards import get_rollcall_keyboard
 from bot.utils import (
     get_msk_now, get_target_date_str, get_today_date_str,
@@ -15,7 +16,7 @@ from db import (
     register_chat, update_chat_sheet, get_chat_sheet,
     save_vote, get_votes_for_date, save_poll_message_id,
     get_poll_message_id, get_target_date_by_message_id, set_checked_in,
-    get_user_vote, remove_vote
+    get_user_vote, remove_vote, get_all_dates_for_chat
 )
 from services.sheets import async_sync_rollcall_to_sheet
 
@@ -56,7 +57,8 @@ async def cmd_start(message: Message):
         "А утром с 06:00 до 11:00 (по МСК) буду отслеживать, кто пришел!\n\n"
         "🔧 <b>Команды:</b>\n"
         "/start_poll — Запустить перекличку вручную (по умолчанию на завтра, можно <code>/start_poll today</code>)\n"
-        "/setup_sheet &lt;URL&gt; — Привязать Google Таблицу",
+        "/setup_sheet &lt;URL&gt; — Привязать Google Таблицу\n"
+        "/sync_sheet — Синхронизировать всю историю перекличек в Google Таблицу",
         parse_mode="HTML"
     )
 
@@ -80,7 +82,63 @@ async def cmd_setup_sheet(message: Message):
 
     sheet_url = args[1].strip()
     await update_chat_sheet(message.chat.id, sheet_url)
-    await message.answer("✅ Google Таблица успешно привязана к чату!", parse_mode="HTML")
+    
+    status_msg = await message.answer("⏳ Google Таблица привязана. Синхронизирую историю перекличек...", parse_mode="HTML")
+    
+    # Синхронизация всех предыдущих дат
+    dates = await get_all_dates_for_chat(message.chat.id)
+    try:
+        dates.sort(key=lambda d: datetime.strptime(d, "%d.%m.%Y"))
+    except Exception:
+        pass
+
+    synced_count = 0
+    for d in dates:
+        votes = await get_votes_for_date(message.chat.id, d)
+        if votes:
+            await async_sync_rollcall_to_sheet(sheet_url, d, votes)
+            synced_count += 1
+
+    await status_msg.edit_text(
+        f"✅ <b>Google Таблица успешно привязана к чату!</b>\n"
+        f"Синхронизировано перекличек за прошлые дни: <b>{synced_count}</b>.",
+        parse_mode="HTML"
+    )
+
+@router.message(Command("sync_sheet"))
+async def cmd_sync_sheet(message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        await message.answer("⛔ <b>У вас нет прав для выполнения этой команды.</b>", parse_mode="HTML")
+        return
+
+    if message.chat.type in ["group", "supergroup"] and message.chat.id not in ALLOWED_CHAT_IDS:
+        return
+
+    sheet_url = await get_chat_sheet(message.chat.id)
+    if not sheet_url:
+        await message.answer("⚠️ Google Таблица еще не привязана. Используйте <code>/setup_sheet &lt;URL&gt;</code>", parse_mode="HTML")
+        return
+
+    status_msg = await message.answer("⏳ Запущена синхронизация всех перекличек в Google Таблицу...", parse_mode="HTML")
+
+    dates = await get_all_dates_for_chat(message.chat.id)
+    try:
+        dates.sort(key=lambda d: datetime.strptime(d, "%d.%m.%Y"))
+    except Exception:
+        pass
+
+    synced_count = 0
+    for d in dates:
+        votes = await get_votes_for_date(message.chat.id, d)
+        if votes:
+            await async_sync_rollcall_to_sheet(sheet_url, d, votes)
+            synced_count += 1
+
+    await status_msg.edit_text(
+        f"✅ <b>Синхронизация завершена!</b>\n"
+        f"Выгружено дат в Google Таблицу: <b>{synced_count}</b>.",
+        parse_mode="HTML"
+    )
 
 @router.message(Command("start_poll"))
 async def cmd_start_poll(message: Message):

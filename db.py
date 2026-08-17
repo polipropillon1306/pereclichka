@@ -133,3 +133,12 @@ async def remove_vote(chat_id: int, target_date: str, user_id: int):
         """, (chat_id, target_date, user_id))
         await db.commit()
 
+async def get_all_dates_for_chat(chat_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("""
+            SELECT DISTINCT target_date FROM rollcalls
+            WHERE chat_id = ?
+        """, (chat_id,)) as cursor:
+            rows = await cursor.fetchall()
+            return [r[0] for r in rows]
+
