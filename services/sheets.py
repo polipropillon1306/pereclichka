@@ -136,7 +136,7 @@ def sync_rollcall_to_sheet(sheet_url: str, target_date: str, votes: List[Tuple])
         # 1. Считываем всю таблицу за 1 сетевой запрос
         all_values = worksheet.get_all_values()
 
-        if not all_values:
+        if not all_values or not all_values[0] or all_values[0][0] != "Имя участника":
             headers = ["Имя участника", "Telegram"]
             user_rows = []
         else:
@@ -235,8 +235,8 @@ def sync_rollcall_to_sheet(sheet_url: str, target_date: str, votes: List[Tuple])
         # 8. Собираем итоговую матрицу
         final_matrix = [headers] + user_rows + [summary_row]
 
-        # 9. Записываем ВСЮ таблицу за 1 пакетный запрос
-        worksheet.update(final_matrix, "A1")
+        # 9. Записываем ВСЮ таблицу за 1 пакетный запрос с автоматической интерпретацией текста
+        worksheet.update(final_matrix, "A1", value_input_option="USER_ENTERED")
         logger.info(f"Успешно синхронизировано в Google Sheets (лист {worksheet.title}) для даты {target_date}")
         return None
     except Exception as e:
