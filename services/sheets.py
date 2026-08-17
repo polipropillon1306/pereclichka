@@ -109,7 +109,7 @@ def sync_rollcall_to_sheet(sheet_url: str, target_date: str, votes: List[Tuple])
                     user_row_map[normalize_key(full_name)] = new_idx
                 existing_users.append(new_row)
 
-        # Очищаем ячейку для тех, кто снял отметку
+        # Для тех, кто не отметился на эту дату (но есть в списке участников таблицы)
         for idx, row in enumerate(existing_users[1:], start=2):
             name = row[0] if len(row) > 0 else ""
             username = row[1] if len(row) > 1 else ""
@@ -117,8 +117,9 @@ def sync_rollcall_to_sheet(sheet_url: str, target_date: str, votes: List[Tuple])
             n_key = normalize_key(name) if name else None
             is_active = (u_key and u_key in active_keys) or (n_key and n_key in active_keys)
             if not is_active:
-                if len(row) >= date_col_idx and row[date_col_idx - 1]:
-                    worksheet.update_cell(idx, date_col_idx, "")
+                current_val = row[date_col_idx - 1] if len(row) >= date_col_idx else ""
+                if current_val != "Не отметился":
+                    worksheet.update_cell(idx, date_col_idx, "Не отметился")
 
         logger.info(f"Успешно синхронизировано в Google Sheets для даты {target_date}")
     except Exception as e:
