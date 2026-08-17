@@ -85,17 +85,22 @@ def sync_rollcall_to_sheet(sheet_url: str, target_date: str, votes: List[Tuple])
                 status_text = "+ (Пришел)"
             elif status == '+' and not checked_in:
                 status_text = "+ (Ожидается)"
+            elif status == '-':
+                status_text = "- (Не будет)"
+
+            # Экранируем спецсимволы формул (+, -, =) для Google Таблиц
+            cell_value = f"'{status_text}" if status_text.startswith(('+', '-', '=')) else status_text
 
             if lookup_key in user_row_map:
                 row_num = user_row_map[lookup_key]
-                worksheet.update_cell(row_num, date_col_idx, status_text)
+                worksheet.update_cell(row_num, date_col_idx, cell_value)
             else:
                 # Добавляем нового участника
                 new_row = [full_name, f"@{username}" if username else ""]
                 # Заполняем пустыми значениями до нужной колонки
                 while len(new_row) < date_col_idx - 1:
                     new_row.append("")
-                new_row.append(status_text)
+                new_row.append(cell_value)
                 worksheet.append_row(new_row)
                 new_idx = len(existing_users) + 1
                 if username:
