@@ -1,22 +1,24 @@
 import html
 import logging
+import re
+from datetime import datetime
 from aiogram import Router, F
 from aiogram.filters import Command
 from aiogram.filters.chat_member_updated import ChatMemberUpdatedFilter, MEMBER, ADMINISTRATOR
-from aiogram.types import Message, CallbackQuery, ChatMemberUpdated
-from datetime import datetime
+from aiogram.types import Message, CallbackQuery, ChatMemberUpdated, FSInputFile
 from bot.keyboards import get_rollcall_keyboard
 from bot.utils import (
     get_msk_now, get_target_date_str, get_today_date_str,
-    get_current_poll_date_str, format_poll_text
+    get_current_poll_date_str, format_poll_text, format_stats_text
 )
 from bot.filters import is_admin
-from config import ALLOWED_CHAT_IDS
+from config import ALLOWED_CHAT_IDS, DB_PATH
 from db import (
     register_chat, update_chat_sheet, get_chat_sheet,
     save_vote, get_votes_for_date, save_poll_message_id,
     get_poll_message_id, get_target_date_by_message_id, set_checked_in,
-    get_user_vote, remove_vote, get_all_dates_for_chat
+    get_user_vote, remove_vote, get_all_dates_for_chat,
+    find_user_by_identifier, get_attendance_stats
 )
 from services.sheets import async_sync_rollcall_to_sheet
 
@@ -53,12 +55,15 @@ async def cmd_start(message: Message):
 
     await message.answer(
         "👋 <b>Привет! Я бот для проведения ежедневных перекличек.</b>\n\n"
-        "Каждый день в 20:00 (по МСК) я буду спрашивать, кто будет завтра.\n"
-        "А утром с 06:00 до 11:00 (по МСК) буду отслеживать, кто пришел!\n\n"
-        "🔧 <b>Команды:</b>\n"
-        "/start_poll — Запустить перекличку вручную (по умолчанию на завтра, можно <code>/start_poll today</code>)\n"
-        "/setup_sheet &lt;URL&gt; — Привязать Google Таблицу\n"
-        "/sync_sheet — Синхронизировать всю историю перекличек в Google Таблицу",
+        "Каждый день в 20:00 (по МСК) я провожу опрос на следующий день.\n"
+        "С 06:00 до 20:00 (по МСК) я фиксирую выход и время прибытия на объект!\n\n"
+        "🔧 <b>Команды управления:</b>\n"
+        "• /start_poll — Запустить перекличку вручную\n"
+        "• /setup_sheet &lt;URL&gt; — Привязать Google Таблицу\n"
+        "• /sync_sheet — Синхронизировать историю в таблицу\n"
+        "• /mark &lt;@user&gt; &lt;+|-|del&gt; [время] — Корректировка статуса работника админом\n"
+        "• /stats [MM.YYYY] — Статистика посещаемости и надежности\n"
+        "• /backup — Получить резервную копию базы данных",
         parse_mode="HTML"
     )
 
@@ -188,6 +193,156 @@ async def cmd_start_poll(message: Message):
     except Exception as e:
         logger.warning(f"Не удалось закрепить сообщение: {e}")
 
+@router.message(Command("mark"))
+async def cmd_mark(message: Message):
+    """Ручная отметка работника администратором: /mark @username + [время]"""
+    if message.chat.type == "private":
+        await message.answer("⛔ <b>Команда доступна только внутри рабочей группы.</b>", parse_mode="HTML")
+        return
+
+    if not message.from_user or not is_admin(message.from_user.id):
+        await message.answer("⛔ <b>У вас нет прав для этой команды.</b>", parse_mode="HTML")
+        return
+
+    parts = message.text.split()
+    if len(parts) < 3:
+        await message.answer(
+            "⚠️ <b>Использование команды:</b>\n"
+            "<code>/mark @username +</code> — отметить «Будет»\n"
+            "<code>/mark @username + 08:30</code> — отметить «Пришел в 08:30»\n"
+            "<code>/mark @username -</code> — отметить «Не будет»\n"
+            "<code>/mark @username del</code> — удалить отметку",
+            parse_mode="HTML"
+        )
+        return
+
+    user_identifier = parts[1]
+    new_status = parts[2].lower()
+    time_arg = parts[3] if len(parts) > 3 else None
+
+    # Валидация формата времени HH:MM если передано
+    if time_arg and not re.match(r"^\d{1,2}:\d{2}$", time_arg):
+        time_arg = None
+
+    now = get_msk_now()
+    target_date = get_current_poll_date_str(now)
+
+    # Ищем пользователя в базе
+    user_info = await find_user_by_identifier(message.chat.id, user_identifier)
+    if not user_info:
+        # Если пользователя еще не было в базе, генерируем временные данные
+        user_id = abs(hash(user_identifier)) % (10 ** 9)
+        username = user_identifier.lstrip("@")
+        full_name = username
+    else:
+        user_id = user_info["user_id"]
+        username = user_info["username"]
+        full_name = user_info["full_name"]
+
+    if new_status in ["del", "delete", "снять", "0"]:
+        await remove_vote(message.chat.id, target_date, user_id)
+        action_text = "отметка удалена"
+    elif new_status in ["+", "+1", "будет", "пришел"]:
+        checked_in = 1 if time_arg else 0
+        await save_vote(
+            chat_id=message.chat.id,
+            target_date=target_date,
+            user_id=user_id,
+            username=username,
+            full_name=full_name,
+            status="+",
+            checkin_time=time_arg,
+            checked_in=checked_in
+        )
+        action_text = f"отмечен как «Будет»{' (пришел в ' + time_arg + ')' if time_arg else ''}"
+    elif new_status in ["-", "-1", "не будет", "отказ"]:
+        await save_vote(
+            chat_id=message.chat.id,
+            target_date=target_date,
+            user_id=user_id,
+            username=username,
+            full_name=full_name,
+            status="-"
+        )
+        action_text = "отмечен как «Не будет»"
+    else:
+        await message.answer("⚠️ Неизвестный статус. Используйте <code>+</code>, <code>-</code> или <code>del</code>", parse_mode="HTML")
+        return
+
+    # Обновляем опрос в чате
+    votes = await get_votes_for_date(message.chat.id, target_date)
+    poll_msg_id = await get_poll_message_id(message.chat.id, target_date)
+    if poll_msg_id:
+        try:
+            new_text = format_poll_text(target_date, votes)
+            await message.bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=poll_msg_id,
+                text=new_text,
+                reply_markup=get_rollcall_keyboard(),
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+
+    # Синхронизация с таблицей
+    sheet_url = await get_chat_sheet(message.chat.id)
+    if sheet_url:
+        await async_sync_rollcall_to_sheet(sheet_url, target_date, votes, bot=message.bot, chat_id=message.chat.id)
+
+    name_display = f"@{username}" if username else full_name
+    await message.answer(f"✅ Для <b>{html.escape(name_display)}</b> на дату <b>{target_date}</b> {action_text}.", parse_mode="HTML")
+
+@router.message(Command("stats"))
+async def cmd_stats(message: Message):
+    """Сводная статистика посещаемости: /stats или /stats 08.2026"""
+    if message.chat.type == "private":
+        await message.answer("⛔ <b>Статистика доступна только внутри рабочей группы.</b>", parse_mode="HTML")
+        return
+
+    if not message.from_user or not is_admin(message.from_user.id):
+        await message.answer("⛔ <b>У вас нет прав для просмотра статистики.</b>", parse_mode="HTML")
+        return
+
+    args = message.text.split(maxsplit=1)
+    if len(args) > 1 and args[1].strip():
+        period_arg = args[1].strip()
+        # Проверяем формат MM.YYYY
+        if re.match(r"^\d{2}\.\d{4}$", period_arg):
+            month_year = period_arg
+            period_name = period_arg
+        else:
+            month_year = None
+            period_name = period_arg
+    else:
+        now = get_msk_now()
+        month_year = now.strftime("%m.%Y")
+        period_name = f"{now.strftime('%m.%Y')} (текущий месяц)"
+
+    stats_list, total_dates = await get_attendance_stats(message.chat.id, month_year)
+    text = format_stats_text(stats_list, total_dates, period_name)
+    await message.answer(text, parse_mode="HTML")
+
+@router.message(Command("backup"))
+async def cmd_backup(message: Message):
+    """Отправка резервной копии базы данных администратору в ЛС"""
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+
+    try:
+        db_file = FSInputFile(DB_PATH, filename="bot_data.db")
+        await message.bot.send_document(
+            chat_id=message.from_user.id,
+            document=db_file,
+            caption="💾 <b>Резервная копия базы данных переклички</b>",
+            parse_mode="HTML"
+        )
+        if message.chat.type != "private":
+            await message.answer("✅ Резервная копия базы данных отправлена вам в личные сообщения!", parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Ошибка создания бэкапа: {e}")
+        await message.answer("⚠️ Не удалось отправить резервную копию базы данных.", parse_mode="HTML")
+
 @router.callback_query(F.data.startswith("vote_"))
 async def process_vote_callback(callback: CallbackQuery):
     status = callback.data.split("_")[1]  # '+' или '-'
@@ -286,17 +441,20 @@ async def handle_messages(message: Message):
             "👋 <b>Привет! Я бот для проведения ежедневных перекличек.</b>\n\n"
             "⚠️ <i>Все команды переклички и опросы проводятся только внутри рабочей группы.</i>\n\n"
             "🔧 <b>Команды для группы:</b>\n"
-            "/start_poll — Запустить опрос вручную\n"
-            "/setup_sheet &lt;URL&gt; — Привязать Google Таблицу\n"
-            "/sync_sheet — Синхронизировать историю в таблицу",
+            "• /start_poll — Запустить опрос вручную\n"
+            "• /setup_sheet &lt;URL&gt; — Привязать Google Таблицу\n"
+            "• /sync_sheet — Синхронизировать историю в таблицу\n"
+            "• /mark &lt;@user&gt; &lt;+|-|del&gt; [время] — Корректировка статуса\n"
+            "• /stats — Статистика посещаемости",
             parse_mode="HTML"
         )
         return
 
-    # 1. Отслеживание прихода (с 06:00 до 20:00 по МСК) на СЕГОДНЯ (учитываем текст, фото и любые сообщения)
+    # 1. Отслеживание прихода (с 06:00 до 20:00 по МСК) на СЕГОДНЯ с сохранением времени прибытия
     if 6 <= now.hour < 20:
         today_date = get_today_date_str(now)
-        was_checked_in = await set_checked_in(chat_id, today_date, user.id)
+        checkin_time = now.strftime("%H:%M")
+        was_checked_in = await set_checked_in(chat_id, today_date, user.id, checkin_time)
         # Синхронизируем статус прихода с Google Таблицей только если статус изменился
         if was_checked_in:
             sheet_url = await get_chat_sheet(chat_id)

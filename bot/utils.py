@@ -6,6 +6,12 @@ from config import TIMEZONE
 
 MSK_TZ = ZoneInfo(TIMEZONE)
 
+MONTH_NAMES_RU = {
+    1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель",
+    5: "Май", 6: "Июнь", 7: "Июль", 8: "Август",
+    9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь"
+}
+
 def get_msk_now() -> datetime:
     """Возвращает текущее время по Москве"""
     return datetime.now(MSK_TZ)
@@ -38,19 +44,42 @@ def get_current_poll_date_str(now: datetime = None) -> str:
         return get_today_date_str(now)
     return get_target_date_str(now)
 
+def get_month_sheet_title(date_str: str) -> str:
+    """
+    Преобразует дату формата 'DD.MM.YYYY' в название листа месяца 'Месяц YYYY'.
+    Например: '17.08.2026' -> 'Август 2026'
+    """
+    try:
+        dt = datetime.strptime(date_str.strip(), "%d.%m.%Y")
+        month_name = MONTH_NAMES_RU.get(dt.month, f"Месяц {dt.month}")
+        return f"{month_name} {dt.year}"
+    except Exception:
+        return "Посещаемость"
+
 def format_poll_text(target_date: str, votes: List[Tuple]) -> str:
     """
     Формирует красивый HTML текст сообщения с перекличкой
-    votes: list of (user_id, username, full_name, status, checked_in)
+    votes: list of (user_id, username, full_name, status, checked_in, [checkin_time])
     """
     going = []
     not_going = []
 
-    for user_id, username, full_name, status, checked_in in votes:
+    for item in votes:
+        user_id = item[0]
+        username = item[1]
+        full_name = item[2]
+        status = item[3]
+        checked_in = item[4]
+        checkin_time = item[5] if len(item) > 5 else None
+
         name = f"@{username}" if username else full_name
         safe_name = html.escape(name)
         if status == '+':
-            check_mark = " ✅ (в чате)" if checked_in else ""
+            if checked_in:
+                time_str = f" {checkin_time}" if checkin_time else ""
+                check_mark = f" ✅ (в чате{time_str})"
+            else:
+                check_mark = ""
             going.append(f"• {safe_name}{check_mark}")
         elif status == '-':
             not_going.append(f"• {safe_name}")
@@ -71,4 +100,30 @@ def format_poll_text(target_date: str, votes: List[Tuple]) -> str:
         text += "<i>Никого</i>\n"
 
     text += "\nОтвечайте кнопками ниже или отправьте <b>+</b> / <b>-</b> в чат."
+    return text
+
+def format_stats_text(stats_list: list, total_dates: int, period_name: str) -> str:
+    """
+    Формирует HTML текст для команды /stats
+    """
+    if not stats_list or total_dates == 0:
+        return f"📊 <b>Статистика за {period_name}:</b>\n\n<i>Данных о перекличках за этот период нет.</i>"
+
+    text = f"📊 <b>Статистика посещаемости ({period_name})</b>\n"
+    text += f"Всего рабочих смен/перекличек: <b>{total_dates}</b>\n\n"
+
+    for i, s in enumerate(stats_list, start=1):
+        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+        user_name = f"@{s['username']}" if s['username'] else s['full_name']
+        safe_name = html.escape(user_name)
+
+        text += (
+            f"{medal} <b>{safe_name}</b>\n"
+            f"   • Вышел на смену: <b>{s['attended']}</b>\n"
+            f"   • Ожидался (не подтвердил): <b>{s['expected']}</b>\n"
+            f"   • Отказался: <b>{s['not_going']}</b>\n"
+            f"   • Пропустил опрос: <b>{s['unmarked']}</b>\n"
+            f"   • Надежность выхода: <b>{s['reliability']}%</b>\n\n"
+        )
+
     return text

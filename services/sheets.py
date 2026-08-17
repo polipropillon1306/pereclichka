@@ -6,6 +6,7 @@ import gspread
 import google.auth
 from google.oauth2.service_account import Credentials
 from config import GOOGLE_SERVICE_ACCOUNT_FILE
+from bot.utils import get_month_sheet_title
 
 logger = logging.getLogger(__name__)
 
@@ -32,11 +33,94 @@ def normalize_key(s: str) -> str:
     """Нормализует имя/username (убирает @, пробелы и приводит к нижнему регистру)"""
     return s.strip().lstrip('@').lower()
 
+def apply_conditional_formatting(spreadsheet, sheet_id: int):
+    """Настраивает автоматическую подсветку статусов в Google Таблице"""
+    rules = [
+        # Зеленый — Пришел
+        {
+            'addConditionalFormatRule': {
+                'rule': {
+                    'ranges': [{'sheetId': sheet_id, 'startRowIndex': 1, 'startColumnIndex': 2}],
+                    'booleanRule': {
+                        'condition': {'type': 'TEXT_CONTAINS', 'values': [{'userEnteredValue': 'Пришел'}]},
+                        'format': {
+                            'backgroundColor': {'red': 0.85, 'green': 0.92, 'blue': 0.83},
+                            'textFormat': {'foregroundColor': {'red': 0.15, 'green': 0.31, 'blue': 0.07}, 'bold': True}
+                        }
+                    }
+                },
+                'index': 0
+            }
+        },
+        # Желтый — Ожидается
+        {
+            'addConditionalFormatRule': {
+                'rule': {
+                    'ranges': [{'sheetId': sheet_id, 'startRowIndex': 1, 'startColumnIndex': 2}],
+                    'booleanRule': {
+                        'condition': {'type': 'TEXT_CONTAINS', 'values': [{'userEnteredValue': 'Ожидается'}]},
+                        'format': {
+                            'backgroundColor': {'red': 1.0, 'green': 0.95, 'blue': 0.80},
+                            'textFormat': {'foregroundColor': {'red': 0.50, 'green': 0.38, 'blue': 0.0}}
+                        }
+                    }
+                },
+                'index': 1
+            }
+        },
+        # Красный — Не будет
+        {
+            'addConditionalFormatRule': {
+                'rule': {
+                    'ranges': [{'sheetId': sheet_id, 'startRowIndex': 1, 'startColumnIndex': 2}],
+                    'booleanRule': {
+                        'condition': {'type': 'TEXT_CONTAINS', 'values': [{'userEnteredValue': 'Не будет'}]},
+                        'format': {
+                            'backgroundColor': {'red': 0.99, 'green': 0.90, 'blue': 0.80},
+                            'textFormat': {'foregroundColor': {'red': 0.47, 'green': 0.25, 'blue': 0.02}}
+                        }
+                    }
+                },
+                'index': 2
+            }
+        },
+        # Серый — Не отметился
+        {
+            'addConditionalFormatRule': {
+                'rule': {
+                    'ranges': [{'sheetId': sheet_id, 'startRowIndex': 1, 'startColumnIndex': 2}],
+                    'booleanRule': {
+                        'condition': {'type': 'TEXT_CONTAINS', 'values': [{'userEnteredValue': 'Не отметился'}]},
+                        'format': {
+                            'backgroundColor': {'red': 0.94, 'green': 0.94, 'blue': 0.94},
+                            'textFormat': {'foregroundColor': {'red': 0.45, 'green': 0.45, 'blue': 0.45}}
+                        }
+                    }
+                },
+                'index': 3
+            }
+        }
+    ]
+    try:
+        spreadsheet.batch_update({'requests': rules})
+    except Exception as e:
+        logger.warning(f"Не удалось применить условное форматирование: {e}")
+
+def get_or_create_month_worksheet(spreadsheet, target_date: str):
+    """Возвращает лист текущего месяца (например 'Август 2026') или создает его"""
+    month_title = get_month_sheet_title(target_date)
+    try:
+        ws = spreadsheet.worksheet(month_title)
+        return ws
+    except gspread.exceptions.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title=month_title, rows=100, cols=40)
+        apply_conditional_formatting(spreadsheet, ws.id)
+        return ws
+
 def sync_rollcall_to_sheet(sheet_url: str, target_date: str, votes: List[Tuple]) -> Optional[str]:
     """
-    votes: list of (user_id, username, full_name, status, checked_in)
-    Синхронизирует результаты переклички в Google Таблицу пакетным обновлением (Batch Update).
-    Возвращает None в случае успеха или текст ошибки при сбое.
+    votes: list of (user_id, username, full_name, status, checked_in, [checkin_time])
+    Синхронизирует результаты переклички в Google Таблицу на вкладку месяца.
     """
     if not sheet_url:
         return None
@@ -47,28 +131,32 @@ def sync_rollcall_to_sheet(sheet_url: str, target_date: str, votes: List[Tuple])
 
     try:
         spreadsheet = client.open_by_url(sheet_url)
-        worksheet = spreadsheet.sheet1
+        worksheet = get_or_create_month_worksheet(spreadsheet, target_date)
 
         # 1. Считываем всю таблицу за 1 сетевой запрос
         all_values = worksheet.get_all_values()
 
         if not all_values:
             headers = ["Имя участника", "Telegram"]
-            all_values = [headers]
+            user_rows = []
         else:
             headers = list(all_values[0])
+            user_rows = all_values[1:]
+
+        # Отделяем строку «ИТОГО ВЫШЛО» если она уже была в конце
+        if user_rows and len(user_rows[-1]) > 0 and "ИТОГО" in user_rows[-1][0].upper():
+            user_rows = user_rows[:-1]
 
         # 2. Добавляем колонку с датой, если ее еще нет
         if target_date not in headers:
             headers.append(target_date)
-            all_values[0] = headers
 
         date_col_idx = headers.index(target_date)
         num_cols = len(headers)
 
         # 3. Индексируем существующих участников
         user_row_map = {}
-        for idx, row in enumerate(all_values[1:], start=1):
+        for idx, row in enumerate(user_rows):
             name = row[0] if len(row) > 0 else ""
             username = row[1] if len(row) > 1 else ""
             if username:
@@ -78,10 +166,18 @@ def sync_rollcall_to_sheet(sheet_url: str, target_date: str, votes: List[Tuple])
 
         # 4. Формируем маппинг активных голосов
         active_votes_map = {}
-        for user_id, username, full_name, status, checked_in in votes:
+        for item in votes:
+            user_id = item[0]
+            username = item[1]
+            full_name = item[2]
+            status = item[3]
+            checked_in = item[4]
+            checkin_time = item[5] if len(item) > 5 else None
+
             status_text = status
             if status == '+' and checked_in:
-                status_text = "+ (Пришел)"
+                time_str = f" {checkin_time}" if checkin_time else ""
+                status_text = f"+ (Пришел{time_str})"
             elif status == '+' and not checked_in:
                 status_text = "+ (Ожидается)"
             elif status == '-':
@@ -94,9 +190,9 @@ def sync_rollcall_to_sheet(sheet_url: str, target_date: str, votes: List[Tuple])
 
         # 5. Обновляем строки существующих пользователей
         matched_keys = set()
-        for idx, row in enumerate(all_values[1:], start=1):
+        for idx, row in enumerate(user_rows):
             while len(row) < num_cols:
-                row.append("")
+                row.append("Не отметился")
 
             name = row[0] if len(row) > 0 else ""
             username = row[1] if len(row) > 1 else ""
@@ -115,21 +211,33 @@ def sync_rollcall_to_sheet(sheet_url: str, target_date: str, votes: List[Tuple])
             else:
                 row[date_col_idx] = "Не отметился"
 
-            all_values[idx] = row
+            user_rows[idx] = row
 
-        # 6. Добавляем новых участников, которых еще не было в таблице
+        # 6. Добавляем новых участников
         for key, (cell_value, full_name, username) in active_votes_map.items():
             if key not in matched_keys:
                 new_row = [full_name, f"@{username}" if username else ""]
                 while len(new_row) < num_cols:
                     new_row.append("Не отметился")
                 new_row[date_col_idx] = cell_value
-                all_values.append(new_row)
+                user_rows.append(new_row)
                 matched_keys.add(key)
 
-        # 7. Записываем ВСЮ таблицу за 1 пакетный запрос (быстро и без исчерпания квот)
-        worksheet.update(all_values, "A1")
-        logger.info(f"Успешно синхронизировано в Google Sheets (batch update) для даты {target_date}")
+        # 7. Формируем строку «ИТОГО ВЫШЛО» (подсчет числа вышедших на каждую дату)
+        summary_row = ["ИТОГО ВЫШЛО", ""]
+        for c_idx in range(2, num_cols):
+            present_count = 0
+            for r in user_rows:
+                if len(r) > c_idx and "Пришел" in r[c_idx]:
+                    present_count += 1
+            summary_row.append(str(present_count))
+
+        # 8. Собираем итоговую матрицу
+        final_matrix = [headers] + user_rows + [summary_row]
+
+        # 9. Записываем ВСЮ таблицу за 1 пакетный запрос
+        worksheet.update(final_matrix, "A1")
+        logger.info(f"Успешно синхронизировано в Google Sheets (лист {worksheet.title}) для даты {target_date}")
         return None
     except Exception as e:
         err_msg = f"Ошибка записи в Google Sheets: {e}"

@@ -27,11 +27,18 @@ async def init_db():
                 username TEXT,
                 full_name TEXT,
                 status TEXT, -- '+' или '-'
-                checked_in INTEGER DEFAULT 0, -- 1 если написал с 06:00 до 11:00
+                checked_in INTEGER DEFAULT 0, -- 1 если подтвердил приход
+                checkin_time TEXT, -- HH:MM
                 message_id INTEGER,
                 UNIQUE(chat_id, target_date, user_id)
             )
         """)
+        # Миграция схемы, если таблица уже создана без checkin_time
+        try:
+            await db.execute("ALTER TABLE rollcalls ADD COLUMN checkin_time TEXT")
+        except Exception:
+            pass
+
         # Хранение ID сообщений опроса для редактирования
         await db.execute("""
             CREATE TABLE IF NOT EXISTS poll_messages (
@@ -66,32 +73,44 @@ async def get_all_chats():
         async with db.execute("SELECT chat_id, sheet_url, poll_time, check_time FROM chats") as cursor:
             return await cursor.fetchall()
 
-async def save_vote(chat_id: int, target_date: str, user_id: int, username: str, full_name: str, status: str):
+async def save_vote(chat_id: int, target_date: str, user_id: int, username: str, full_name: str, status: str, checkin_time: str = None, checked_in: int = None):
     async with aiosqlite.connect(DB_PATH) as db:
+        chk = checked_in
+        tm = checkin_time
+
         await db.execute("""
-            INSERT INTO rollcalls (chat_id, target_date, user_id, username, full_name, status)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO rollcalls (chat_id, target_date, user_id, username, full_name, status, checked_in, checkin_time)
+            VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, 0), ?)
             ON CONFLICT(chat_id, target_date, user_id) DO UPDATE SET
                 status = excluded.status,
                 username = excluded.username,
                 full_name = excluded.full_name,
-                checked_in = CASE WHEN excluded.status = '+' THEN checked_in ELSE 0 END
-        """, (chat_id, target_date, user_id, username, full_name, status))
+                checked_in = CASE 
+                    WHEN ? IS NOT NULL THEN ?
+                    WHEN excluded.status = '+' THEN checked_in 
+                    ELSE 0 
+                END,
+                checkin_time = CASE 
+                    WHEN ? IS NOT NULL THEN ?
+                    WHEN excluded.status = '+' THEN checkin_time 
+                    ELSE NULL 
+                END
+        """, (chat_id, target_date, user_id, username, full_name, status, chk, tm, chk, chk, tm, tm))
         await db.commit()
 
-async def set_checked_in(chat_id: int, target_date: str, user_id: int) -> bool:
+async def set_checked_in(chat_id: int, target_date: str, user_id: int, checkin_time: str = None) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("""
-            UPDATE rollcalls SET checked_in = 1
+            UPDATE rollcalls SET checked_in = 1, checkin_time = ?
             WHERE chat_id = ? AND target_date = ? AND user_id = ? AND status = '+' AND checked_in = 0
-        """, (chat_id, target_date, user_id))
+        """, (checkin_time, chat_id, target_date, user_id))
         await db.commit()
         return cursor.rowcount > 0
 
 async def get_votes_for_date(chat_id: int, target_date: str):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("""
-            SELECT user_id, username, full_name, status, checked_in
+            SELECT user_id, username, full_name, status, checked_in, checkin_time
             FROM rollcalls
             WHERE chat_id = ? AND target_date = ?
         """, (chat_id, target_date)) as cursor:
@@ -144,3 +163,94 @@ async def get_all_dates_for_chat(chat_id: int):
             rows = await cursor.fetchall()
             return [r[0] for r in rows]
 
+async def find_user_by_identifier(chat_id: int, identifier: str):
+    """Ищет пользователя в истории перекличек чата по @username или имени"""
+    clean_id = identifier.strip().lstrip('@').lower()
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Поиск по username
+        async with db.execute("""
+            SELECT user_id, username, full_name FROM rollcalls
+            WHERE chat_id = ? AND LOWER(username) = ?
+            ORDER BY id DESC LIMIT 1
+        """, (chat_id, clean_id)) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return {"user_id": row[0], "username": row[1], "full_name": row[2]}
+
+        # Поиск по частичному совпадению full_name
+        async with db.execute("""
+            SELECT user_id, username, full_name FROM rollcalls
+            WHERE chat_id = ? AND LOWER(full_name) LIKE ?
+            ORDER BY id DESC LIMIT 1
+        """, (chat_id, f"%{clean_id}%")) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return {"user_id": row[0], "username": row[1], "full_name": row[2]}
+
+    return None
+
+async def get_attendance_stats(chat_id: int, month_year: str = None):
+    """
+    Агрегирует статистику по участникам за месяц (например '08.2026') или все время.
+    Возвращает: (stats_list, total_dates_count)
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        query = """
+            SELECT user_id, username, full_name, status, checked_in, target_date
+            FROM rollcalls
+            WHERE chat_id = ?
+        """
+        params = [chat_id]
+        if month_year:
+            query += " AND target_date LIKE ?"
+            params.append(f"%.{month_year}")
+
+        async with db.execute(query, tuple(params)) as cursor:
+            rows = await cursor.fetchall()
+
+        dates_query = "SELECT DISTINCT target_date FROM rollcalls WHERE chat_id = ?"
+        dates_params = [chat_id]
+        if month_year:
+            dates_query += " AND target_date LIKE ?"
+            dates_params.append(f"%.{month_year}")
+
+        async with db.execute(dates_query, tuple(dates_params)) as cursor:
+            all_dates = [r[0] for r in await cursor.fetchall()]
+
+        total_dates_count = len(all_dates)
+
+        user_stats = {}
+        for uid, uname, fname, status, chk_in, t_date in rows:
+            if uid not in user_stats:
+                user_stats[uid] = {
+                    "user_id": uid,
+                    "username": uname,
+                    "full_name": fname,
+                    "attended": 0,    # + (Пришел)
+                    "expected": 0,    # + (Ожидается)
+                    "not_going": 0,   # - (Не будет)
+                    "total_votes": 0,
+                    "total_polls": total_dates_count
+                }
+            if uname:
+                user_stats[uid]["username"] = uname
+            if fname:
+                user_stats[uid]["full_name"] = fname
+
+            user_stats[uid]["total_votes"] += 1
+            if status == '+':
+                if chk_in:
+                    user_stats[uid]["attended"] += 1
+                else:
+                    user_stats[uid]["expected"] += 1
+            elif status == '-':
+                user_stats[uid]["not_going"] += 1
+
+        stats_list = list(user_stats.values())
+        for s in stats_list:
+            planned = s["attended"] + s["expected"]
+            s["reliability"] = round((s["attended"] / planned * 100)) if planned > 0 else 0
+            s["unmarked"] = max(0, total_dates_count - s["total_votes"])
+
+        stats_list.sort(key=lambda x: (x["attended"], x["reliability"]), reverse=True)
+        return stats_list, total_dates_count
