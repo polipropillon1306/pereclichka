@@ -64,11 +64,15 @@ async def cmd_start(message: Message):
 
 @router.message(Command("setup_sheet"))
 async def cmd_setup_sheet(message: Message):
+    if message.chat.type == "private":
+        await message.answer("⛔ <b>Настройка таблицы доступна только внутри рабочей группы.</b>", parse_mode="HTML")
+        return
+
     if not message.from_user or not is_admin(message.from_user.id):
         await message.answer("⛔ <b>У вас нет прав для настройки таблицы.</b>", parse_mode="HTML")
         return
 
-    if message.chat.type in ["group", "supergroup"] and message.chat.id not in ALLOWED_CHAT_IDS:
+    if message.chat.id not in ALLOWED_CHAT_IDS:
         try:
             await message.bot.leave_chat(message.chat.id)
         except Exception:
@@ -96,7 +100,7 @@ async def cmd_setup_sheet(message: Message):
     for d in dates:
         votes = await get_votes_for_date(message.chat.id, d)
         if votes:
-            await async_sync_rollcall_to_sheet(sheet_url, d, votes)
+            await async_sync_rollcall_to_sheet(sheet_url, d, votes, bot=message.bot, chat_id=message.chat.id)
             synced_count += 1
 
     await status_msg.edit_text(
@@ -107,11 +111,15 @@ async def cmd_setup_sheet(message: Message):
 
 @router.message(Command("sync_sheet"))
 async def cmd_sync_sheet(message: Message):
+    if message.chat.type == "private":
+        await message.answer("⛔ <b>Синхронизация доступна только внутри рабочей группы.</b>", parse_mode="HTML")
+        return
+
     if not message.from_user or not is_admin(message.from_user.id):
         await message.answer("⛔ <b>У вас нет прав для выполнения этой команды.</b>", parse_mode="HTML")
         return
 
-    if message.chat.type in ["group", "supergroup"] and message.chat.id not in ALLOWED_CHAT_IDS:
+    if message.chat.id not in ALLOWED_CHAT_IDS:
         return
 
     sheet_url = await get_chat_sheet(message.chat.id)
@@ -131,7 +139,7 @@ async def cmd_sync_sheet(message: Message):
     for d in dates:
         votes = await get_votes_for_date(message.chat.id, d)
         if votes:
-            await async_sync_rollcall_to_sheet(sheet_url, d, votes)
+            await async_sync_rollcall_to_sheet(sheet_url, d, votes, bot=message.bot, chat_id=message.chat.id)
             synced_count += 1
 
     await status_msg.edit_text(
@@ -142,19 +150,22 @@ async def cmd_sync_sheet(message: Message):
 
 @router.message(Command("start_poll"))
 async def cmd_start_poll(message: Message):
+    if message.chat.type == "private":
+        await message.answer("⛔ <b>Запуск переклички доступен только внутри рабочей группы.</b>", parse_mode="HTML")
+        return
+
     if not message.from_user or not is_admin(message.from_user.id):
         await message.answer("⛔ <b>У вас нет прав для запуска переклички.</b>", parse_mode="HTML")
         return
 
-    if message.chat.type in ["group", "supergroup"] and message.chat.id not in ALLOWED_CHAT_IDS:
+    if message.chat.id not in ALLOWED_CHAT_IDS:
         try:
             await message.bot.leave_chat(message.chat.id)
         except Exception:
             pass
         return
 
-    if message.chat.type in ["group", "supergroup"]:
-        await register_chat(message.chat.id)
+    await register_chat(message.chat.id)
 
     args = message.text.split(maxsplit=1)
     if len(args) > 1 and args[1].strip():
@@ -224,7 +235,7 @@ async def process_vote_callback(callback: CallbackQuery):
     # Синхронизация с Google Sheets
     sheet_url = await get_chat_sheet(chat_id)
     if sheet_url:
-        await async_sync_rollcall_to_sheet(sheet_url, target_date, votes)
+        await async_sync_rollcall_to_sheet(sheet_url, target_date, votes, bot=callback.message.bot, chat_id=chat_id)
 
     # Если утром снял отметку (было '+', стало '-' или снято вовсе), спрашиваем причину
     now = get_msk_now()
@@ -273,9 +284,11 @@ async def handle_messages(message: Message):
     if message.chat.type == "private" and not text.startswith("/"):
         await message.answer(
             "👋 <b>Привет! Я бот для проведения ежедневных перекличек.</b>\n\n"
-            "🔧 <b>Команды:</b>\n"
+            "⚠️ <i>Все команды переклички и опросы проводятся только внутри рабочей группы.</i>\n\n"
+            "🔧 <b>Команды для группы:</b>\n"
             "/start_poll — Запустить опрос вручную\n"
-            "/setup_sheet &lt;URL&gt; — Привязать Google Таблицу",
+            "/setup_sheet &lt;URL&gt; — Привязать Google Таблицу\n"
+            "/sync_sheet — Синхронизировать историю в таблицу",
             parse_mode="HTML"
         )
         return
@@ -289,10 +302,17 @@ async def handle_messages(message: Message):
             sheet_url = await get_chat_sheet(chat_id)
             if sheet_url:
                 votes = await get_votes_for_date(chat_id, today_date)
-                await async_sync_rollcall_to_sheet(sheet_url, today_date, votes)
+                await async_sync_rollcall_to_sheet(sheet_url, today_date, votes, bot=message.bot, chat_id=chat_id)
 
-    # 2. Быстрый ответ + или - на опрос (текстом или в подписи к фото)
-    if text in ["+", "-"]:
+    # 2. Быстрый ответ + / - / буду / не буду на опрос (текстом или в подписи к фото)
+    clean_text = text.lower().strip("!.,? \n\r")
+    parsed_vote = None
+    if clean_text in ["+", "+1", "буду", "плюс", "приду", "я буду", "я приду"]:
+        parsed_vote = "+"
+    elif clean_text in ["-", "-1", "не буду", "минус", "не приду", "не смогу", "я не буду"]:
+        parsed_vote = "-"
+
+    if parsed_vote:
         target_date = None
         if message.reply_to_message:
             target_date = await get_target_date_by_message_id(chat_id, message.reply_to_message.message_id)
@@ -303,7 +323,7 @@ async def handle_messages(message: Message):
         prev_status = await get_user_vote(chat_id, target_date, user.id)
 
         # Если отправил тот же знак повторно — снимаем голос
-        if prev_status == text:
+        if prev_status == parsed_vote:
             await remove_vote(chat_id, target_date, user.id)
             new_status = None
         else:
@@ -313,9 +333,9 @@ async def handle_messages(message: Message):
                 user_id=user.id,
                 username=user.username or "",
                 full_name=user.full_name or "Участник",
-                status=text
+                status=parsed_vote
             )
-            new_status = text
+            new_status = parsed_vote
 
         votes = await get_votes_for_date(chat_id, target_date)
         poll_msg_id = await get_poll_message_id(chat_id, target_date)
@@ -336,7 +356,7 @@ async def handle_messages(message: Message):
         # Синхронизация с Google Sheets
         sheet_url = await get_chat_sheet(chat_id)
         if sheet_url:
-            await async_sync_rollcall_to_sheet(sheet_url, target_date, votes)
+            await async_sync_rollcall_to_sheet(sheet_url, target_date, votes, bot=message.bot, chat_id=chat_id)
 
         # Если утром снял отметку (было '+', стало '-' или снято вовсе), спрашиваем причину
         today_date = get_today_date_str(now)

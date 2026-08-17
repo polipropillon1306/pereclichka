@@ -1,7 +1,7 @@
 import os
 import logging
 import asyncio
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 import gspread
 import google.auth
 from google.oauth2.service_account import Credentials
@@ -13,6 +13,8 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
 ]
+
+_sync_lock = asyncio.Lock()
 
 def get_gspread_client():
     try:
@@ -30,40 +32,43 @@ def normalize_key(s: str) -> str:
     """Нормализует имя/username (убирает @, пробелы и приводит к нижнему регистру)"""
     return s.strip().lstrip('@').lower()
 
-def sync_rollcall_to_sheet(sheet_url: str, target_date: str, votes: List[Tuple]):
+def sync_rollcall_to_sheet(sheet_url: str, target_date: str, votes: List[Tuple]) -> Optional[str]:
     """
     votes: list of (user_id, username, full_name, status, checked_in)
-    Синхронизирует результаты переклички в Google Таблицу.
-    Колонки: Имя участника | Telegram | Дата1 | Дата2 ...
+    Синхронизирует результаты переклички в Google Таблицу пакетным обновлением (Batch Update).
+    Возвращает None в случае успеха или текст ошибки при сбое.
     """
     if not sheet_url:
-        return
+        return None
     
     client = get_gspread_client()
     if not client:
-        return
+        return "Не удалось авторизоваться в Google API (проверьте файл ключа)"
 
     try:
         spreadsheet = client.open_by_url(sheet_url)
-        worksheet = spreadsheet.sheet1  # Берем первый лист
+        worksheet = spreadsheet.sheet1
 
-        # Считываем существующие заголовки (строка 1)
-        headers = worksheet.row_values(1)
-        if not headers:
+        # 1. Считываем всю таблицу за 1 сетевой запрос
+        all_values = worksheet.get_all_values()
+
+        if not all_values:
             headers = ["Имя участника", "Telegram"]
-            worksheet.append_row(headers)
+            all_values = [headers]
+        else:
+            headers = list(all_values[0])
 
+        # 2. Добавляем колонку с датой, если ее еще нет
         if target_date not in headers:
             headers.append(target_date)
-            worksheet.update_cell(1, len(headers), target_date)
+            all_values[0] = headers
 
-        date_col_idx = headers.index(target_date) + 1
+        date_col_idx = headers.index(target_date)
+        num_cols = len(headers)
 
-        # Считываем всех участников из таблицы (столбец Telegram / Имя)
-        existing_users = worksheet.get_all_values()
+        # 3. Индексируем существующих участников
         user_row_map = {}
-        for idx, row in enumerate(existing_users[1:], start=2):
-            # idx - номер строки в gspread
+        for idx, row in enumerate(all_values[1:], start=1):
             name = row[0] if len(row) > 0 else ""
             username = row[1] if len(row) > 1 else ""
             if username:
@@ -71,15 +76,9 @@ def sync_rollcall_to_sheet(sheet_url: str, target_date: str, votes: List[Tuple])
             if name:
                 user_row_map[normalize_key(name)] = idx
 
-        active_keys = set()
+        # 4. Формируем маппинг активных голосов
+        active_votes_map = {}
         for user_id, username, full_name, status, checked_in in votes:
-            if username:
-                active_keys.add(normalize_key(username))
-            if full_name:
-                active_keys.add(normalize_key(full_name))
-
-            lookup_key = normalize_key(username) if username else normalize_key(full_name)
-
             status_text = status
             if status == '+' and checked_in:
                 status_text = "+ (Пришел)"
@@ -88,42 +87,67 @@ def sync_rollcall_to_sheet(sheet_url: str, target_date: str, votes: List[Tuple])
             elif status == '-':
                 status_text = "- (Не будет)"
 
-            # Экранируем спецсимволы формул (+, -, =) для Google Таблиц
             cell_value = f"'{status_text}" if status_text.startswith(('+', '-', '=')) else status_text
+            
+            key = normalize_key(username) if username else normalize_key(full_name)
+            active_votes_map[key] = (cell_value, full_name, username)
 
-            if lookup_key in user_row_map:
-                row_num = user_row_map[lookup_key]
-                worksheet.update_cell(row_num, date_col_idx, cell_value)
-            else:
-                # Добавляем нового участника
-                new_row = [full_name, f"@{username}" if username else ""]
-                # Заполняем пустыми значениями до нужной колонки
-                while len(new_row) < date_col_idx - 1:
-                    new_row.append("")
-                new_row.append(cell_value)
-                worksheet.append_row(new_row)
-                new_idx = len(existing_users) + 1
-                if username:
-                    user_row_map[normalize_key(username)] = new_idx
-                if full_name:
-                    user_row_map[normalize_key(full_name)] = new_idx
-                existing_users.append(new_row)
+        # 5. Обновляем строки существующих пользователей
+        matched_keys = set()
+        for idx, row in enumerate(all_values[1:], start=1):
+            while len(row) < num_cols:
+                row.append("")
 
-        # Для тех, кто не отметился на эту дату (но есть в списке участников таблицы)
-        for idx, row in enumerate(existing_users[1:], start=2):
             name = row[0] if len(row) > 0 else ""
             username = row[1] if len(row) > 1 else ""
             u_key = normalize_key(username) if username else None
             n_key = normalize_key(name) if name else None
-            is_active = (u_key and u_key in active_keys) or (n_key and n_key in active_keys)
-            if not is_active:
-                current_val = row[date_col_idx - 1] if len(row) >= date_col_idx else ""
-                if current_val != "Не отметился":
-                    worksheet.update_cell(idx, date_col_idx, "Не отметился")
 
-        logger.info(f"Успешно синхронизировано в Google Sheets для даты {target_date}")
+            found_key = None
+            if u_key and u_key in active_votes_map:
+                found_key = u_key
+            elif n_key and n_key in active_votes_map:
+                found_key = n_key
+
+            if found_key:
+                matched_keys.add(found_key)
+                row[date_col_idx] = active_votes_map[found_key][0]
+            else:
+                row[date_col_idx] = "Не отметился"
+
+            all_values[idx] = row
+
+        # 6. Добавляем новых участников, которых еще не было в таблице
+        for key, (cell_value, full_name, username) in active_votes_map.items():
+            if key not in matched_keys:
+                new_row = [full_name, f"@{username}" if username else ""]
+                while len(new_row) < num_cols:
+                    new_row.append("Не отметился")
+                new_row[date_col_idx] = cell_value
+                all_values.append(new_row)
+                matched_keys.add(key)
+
+        # 7. Записываем ВСЮ таблицу за 1 пакетный запрос (быстро и без исчерпания квот)
+        worksheet.update(all_values, "A1")
+        logger.info(f"Успешно синхронизировано в Google Sheets (batch update) для даты {target_date}")
+        return None
     except Exception as e:
-        logger.error(f"Ошибка записи в Google Sheets: {e}")
+        err_msg = f"Ошибка записи в Google Sheets: {e}"
+        logger.error(err_msg)
+        return err_msg
 
-async def async_sync_rollcall_to_sheet(sheet_url: str, target_date: str, votes: List[Tuple]):
-    await asyncio.to_thread(sync_rollcall_to_sheet, sheet_url, target_date, votes)
+async def async_sync_rollcall_to_sheet(sheet_url: str, target_date: str, votes: List[Tuple], bot=None, chat_id: int = None):
+    async with _sync_lock:
+        error = await asyncio.to_thread(sync_rollcall_to_sheet, sheet_url, target_date, votes)
+        if error and bot and chat_id:
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        "⚠️ <b>Внимание: Ошибка синхронизации с Google Таблицей!</b>\n\n"
+                        "Пожалуйста, убедитесь, что таблица доступна и сервисный аккаунт добавлен в нее с правами Редактора."
+                    ),
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass

@@ -6,6 +6,8 @@ logger = logging.getLogger(__name__)
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode = WAL;")
+        await db.execute("PRAGMA busy_timeout = 5000;")
         # Реестр чатов
         await db.execute("""
             CREATE TABLE IF NOT EXISTS chats (
