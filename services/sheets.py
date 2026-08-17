@@ -143,9 +143,8 @@ def sync_rollcall_to_sheet(sheet_url: str, target_date: str, votes: List[Tuple])
             headers = list(all_values[0])
             user_rows = all_values[1:]
 
-        # Отделяем строку «ИТОГО ВЫШЛО» если она уже была в конце
-        if user_rows and len(user_rows[-1]) > 0 and "ИТОГО" in user_rows[-1][0].upper():
-            user_rows = user_rows[:-1]
+        # Исключаем любые строки «ИТОГО ВЫШЛО» из списка участников
+        user_rows = [r for r in user_rows if not (len(r) > 0 and "ИТОГО" in r[0].upper())]
 
         # 2. Добавляем колонку с датой, если ее еще нет
         if target_date not in headers:
