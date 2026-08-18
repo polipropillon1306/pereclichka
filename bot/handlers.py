@@ -545,8 +545,10 @@ async def process_vote_callback(callback: CallbackQuery):
     # Если нажал ту же кнопку повторно — снимаем голос (кроме утреннего '+' когда подтверждается приход)
     if prev_status == status:
         if is_morning_today and status == '+':
+            checkin_time = now.strftime("%H:%M")
+            await set_checked_in(chat_id, target_date, user.id, checkin_time)
             new_status = '+'
-            ans_text = "Ваше присутствие подтверждено!"
+            ans_text = f"Ваше присутствие подтверждено ({checkin_time})!"
         else:
             await remove_vote(chat_id, target_date, user.id)
             new_status = None
@@ -646,21 +648,35 @@ async def handle_messages(message: Message):
         today_date = get_today_date_str(now)
         checkin_time = now.strftime("%H:%M")
         was_checked_in = await set_checked_in(chat_id, today_date, user.id, checkin_time)
-        # Синхронизируем статус прихода с Google Таблицей только если статус изменился
+        # Если статус прихода изменился — обновляем закрепленное сообщение и Google Таблицу
         if was_checked_in:
+            votes = await get_votes_for_date(chat_id, today_date)
+            poll_msg_id = await get_poll_message_id(chat_id, today_date)
+            if poll_msg_id:
+                try:
+                    new_text = format_poll_text(today_date, votes)
+                    await message.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=poll_msg_id,
+                        text=new_text,
+                        reply_markup=get_rollcall_keyboard(),
+                        parse_mode="HTML"
+                    )
+                except Exception as e:
+                    logger.warning(f"Не удалось обновить опрос при фиксации прихода: {e}")
+
             sheet_url = await get_chat_sheet(chat_id)
             if sheet_url:
-                votes = await get_votes_for_date(chat_id, today_date)
                 known_users = await get_all_known_users_for_chat(chat_id)
                 await async_sync_rollcall_to_sheet(sheet_url, today_date, votes, bot=message.bot, chat_id=chat_id, known_users=known_users)
 
     # 2. Фиксация времени ухода со смены (текстом или в подписи к фото)
-    clean_text = text.lower().strip("!.,? \n\r")
+    clean_text = text.lower().replace("ё", "е").strip("!.,? \n\r")
     checkout_keywords = [
         "ушел", "ушла", "ухожу", "уехали", "ушли",
-        "домой", "еду домой", "поехал домой", "поехала домой", "поехали домой",
+        "домой", "еду домой", "поехал домой", "поехала домой", "поехали домой", "пошел домой", "пошла домой",
         "закончил", "закончила", "закончили", "смену сдал", "сдал смену",
-        "все на сегодня", "всё на сегодня", "на сегодня все", "на сегодня всё"
+        "все на сегодня", "на сегодня все"
     ]
     is_checkout = False
     for kw in checkout_keywords:
@@ -670,7 +686,15 @@ async def handle_messages(message: Message):
 
     if is_checkout:
         today_date = get_today_date_str(now)
-        checkout_time = now.strftime("%H:%M")
+        # Проверяем, указано ли конкретное время в сообщении (например: "ушел в 18:00" или "ушел 18:00")
+        time_match = re.search(r"\b(\d{1,2}:\d{2})\b", clean_text)
+        if time_match:
+            checkout_time = time_match.group(1)
+            if len(checkout_time) == 4 and checkout_time[1] == ":":
+                checkout_time = f"0{checkout_time}"
+        else:
+            checkout_time = now.strftime("%H:%M")
+
         await set_checked_out(
             chat_id=chat_id,
             target_date=today_date,
