@@ -388,6 +388,28 @@ async def cmd_mark(message: Message):
     name_display = f"@{username}" if username else full_name
     await message.answer(f"✅ Для <b>{html.escape(name_display)}</b> на дату <b>{target_date}</b> {action_text}.", parse_mode="HTML")
 
+    # Если утром админ поставил '-' или удалил отметку, бот также запрашивает причину у работника
+    today_date = get_today_date_str(now)
+    if target_date == today_date and 6 <= now.hour < 20 and (status == "-" or status == "del"):
+        if status == "-":
+            action_desc = "вас отметили как «Не будет»"
+        else:
+            action_desc = "вашу отметку сняли"
+
+        user_mention = f"@{username}" if username else f'<a href="tg://user?id={user_id}">{html.escape(full_name or "Участник")}</a>'
+        text_reason = (
+            f"⚠️ {user_mention}, {action_desc} на сегодня ({target_date}).\n"
+            f"Напишите, пожалуйста, причину, почему не сможете прийти?"
+        )
+        try:
+            await message.bot.send_message(
+                chat_id=message.chat.id,
+                text=text_reason,
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logger.warning(f"Не удалось отправить запрос причины: {e}")
+
 @router.message(Command("stats"))
 async def cmd_stats(message: Message):
     """Сводная статистика посещаемости: /stats, /stats 08.2026, /stats 8, /stats август, /stats все"""
@@ -585,16 +607,23 @@ async def process_vote_callback(callback: CallbackQuery):
         known_users = await get_all_known_users_for_chat(chat_id)
         await async_sync_rollcall_to_sheet(sheet_url, target_date, votes, bot=callback.message.bot, chat_id=chat_id, known_users=known_users)
 
-    # Если утром снял отметку (было '+', стало '-' или снято вовсе), спрашиваем причину
+    # Если утром снял отметку или изменил на '-', спрашиваем причину
     now = get_msk_now()
     today_date = get_today_date_str(now)
-    if prev_status == '+' and target_date == today_date and 6 <= now.hour < 20:
+    if target_date == today_date and 6 <= now.hour < 20:
+        action_desc = None
         if new_status == '-':
-            action_desc = "изменили отметку на «Не буду»"
-        elif new_status is None:
-            action_desc = "сняли отметку «Буду»"
-        else:
-            action_desc = None
+            if prev_status == '+':
+                action_desc = "изменили отметку на «Не буду»"
+            else:
+                action_desc = "поставили отметку «Не буду»"
+        elif new_status is None and prev_status is not None:
+            if prev_status == '+':
+                action_desc = "сняли отметку «Буду»"
+            elif prev_status == '-':
+                action_desc = "сняли отметку «Не буду»"
+            else:
+                action_desc = "сняли отметку"
 
         if action_desc:
             user_mention = f"@{user.username}" if user.username else f'<a href="tg://user?id={user.id}">{html.escape(user.full_name or "Участник")}</a>'
@@ -788,15 +817,22 @@ async def handle_messages(message: Message):
             known_users = await get_all_known_users_for_chat(chat_id)
             await async_sync_rollcall_to_sheet(sheet_url, target_date, votes, bot=message.bot, chat_id=chat_id, known_users=known_users)
 
-        # Если утром снял отметку (было '+', стало '-' или снято вовсе), спрашиваем причину
+        # Если утром снял отметку или изменил на '-', спрашиваем причину
         today_date = get_today_date_str(now)
-        if prev_status == '+' and target_date == today_date and 6 <= now.hour < 20:
+        if target_date == today_date and 6 <= now.hour < 20:
+            action_desc = None
             if new_status == '-':
-                action_desc = "изменили отметку на «Не буду»"
-            elif new_status is None:
-                action_desc = "сняли отметку «Буду»"
-            else:
-                action_desc = None
+                if prev_status == '+':
+                    action_desc = "изменили отметку на «Не буду»"
+                else:
+                    action_desc = "поставили отметку «Не буду»"
+            elif new_status is None and prev_status is not None:
+                if prev_status == '+':
+                    action_desc = "сняли отметку «Буду»"
+                elif prev_status == '-':
+                    action_desc = "сняли отметку «Не буду»"
+                else:
+                    action_desc = "сняли отметку"
 
             if action_desc:
                 user_mention = f"@{user.username}" if user.username else f'<a href="tg://user?id={user.id}">{html.escape(user.full_name or "Участник")}</a>'
