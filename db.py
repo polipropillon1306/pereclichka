@@ -26,21 +26,31 @@ async def init_db():
                 user_id INTEGER,
                 username TEXT,
                 full_name TEXT,
-                status TEXT, -- '+' или '-'
+                status TEXT, -- '+' или '-' или NULL если снят
                 checked_in INTEGER DEFAULT 0, -- 1 если подтвердил приход
                 checkin_time TEXT, -- HH:MM
                 checkout_time TEXT, -- HH:MM
+                change_count INTEGER DEFAULT 0, -- количество изменений отметки
+                reason_requested INTEGER DEFAULT 0, -- 1 если бот уже запросил причину
                 message_id INTEGER,
                 UNIQUE(chat_id, target_date, user_id)
             )
         """)
-        # Миграция схемы, если таблица уже создана без checkin_time / checkout_time
+        # Миграции схемы при обновлении версий
         try:
             await db.execute("ALTER TABLE rollcalls ADD COLUMN checkin_time TEXT")
         except Exception:
             pass
         try:
             await db.execute("ALTER TABLE rollcalls ADD COLUMN checkout_time TEXT")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE rollcalls ADD COLUMN change_count INTEGER DEFAULT 0")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE rollcalls ADD COLUMN reason_requested INTEGER DEFAULT 0")
         except Exception:
             pass
 
@@ -92,19 +102,20 @@ async def get_all_chats():
         async with db.execute("SELECT chat_id, sheet_url, poll_time, check_time FROM chats") as cursor:
             return await cursor.fetchall()
 
-async def save_vote(chat_id: int, target_date: str, user_id: int, username: str, full_name: str, status: str, checkin_time: str = None, checked_in: int = None, checkout_time: str = None):
+async def save_vote(chat_id: int, target_date: str, user_id: int, username: str, full_name: str, status: str, checkin_time: str = None, checked_in: int = None, checkout_time: str = None, increment_change: bool = False):
     async with aiosqlite.connect(DB_PATH) as db:
         chk = checked_in
         tm_in = checkin_time
         tm_out = checkout_time
 
         await db.execute("""
-            INSERT INTO rollcalls (chat_id, target_date, user_id, username, full_name, status, checked_in, checkin_time, checkout_time)
-            VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, 0), ?, ?)
+            INSERT INTO rollcalls (chat_id, target_date, user_id, username, full_name, status, checked_in, checkin_time, checkout_time, change_count)
+            VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, 0), ?, ?, 0)
             ON CONFLICT(chat_id, target_date, user_id) DO UPDATE SET
                 status = excluded.status,
                 username = excluded.username,
                 full_name = excluded.full_name,
+                change_count = CASE WHEN ? THEN COALESCE(change_count, 0) + 1 ELSE COALESCE(change_count, 0) END,
                 checked_in = CASE 
                     WHEN ? IS NOT NULL THEN ?
                     WHEN excluded.status = '+' THEN checked_in 
@@ -120,7 +131,7 @@ async def save_vote(chat_id: int, target_date: str, user_id: int, username: str,
                     WHEN excluded.status = '+' THEN checkout_time 
                     ELSE NULL 
                 END
-        """, (chat_id, target_date, user_id, username, full_name, status, chk, tm_in, tm_out, chk, chk, tm_in, tm_in, tm_out, tm_out))
+        """, (chat_id, target_date, user_id, username, full_name, status, chk, tm_in, tm_out, 1 if increment_change else 0, chk, chk, tm_in, tm_in, tm_out, tm_out))
         await db.commit()
 
 async def set_checked_in(chat_id: int, target_date: str, user_id: int, checkin_time: str = None) -> bool:
@@ -142,8 +153,8 @@ async def set_checked_out(chat_id: int, target_date: str, user_id: int, checkout
         
         if cursor.rowcount == 0:
             await db.execute("""
-                INSERT INTO rollcalls (chat_id, target_date, user_id, username, full_name, status, checked_in, checkout_time)
-                VALUES (?, ?, ?, ?, ?, '+', 1, ?)
+                INSERT INTO rollcalls (chat_id, target_date, user_id, username, full_name, status, checked_in, checkout_time, change_count)
+                VALUES (?, ?, ?, ?, ?, '+', 1, ?, 0)
                 ON CONFLICT(chat_id, target_date, user_id) DO UPDATE SET
                     checkout_time = excluded.checkout_time,
                     checked_in = 1,
@@ -158,7 +169,7 @@ async def get_votes_for_date(chat_id: int, target_date: str):
         async with db.execute("""
             SELECT user_id, username, full_name, status, checked_in, checkin_time, checkout_time
             FROM rollcalls
-            WHERE chat_id = ? AND target_date = ?
+            WHERE chat_id = ? AND target_date = ? AND status IS NOT NULL
         """, (chat_id, target_date)) as cursor:
             return await cursor.fetchall()
 
@@ -190,12 +201,66 @@ async def get_user_vote(chat_id: int, target_date: str, user_id: int):
             WHERE chat_id = ? AND target_date = ? AND user_id = ?
         """, (chat_id, target_date, user_id)) as cursor:
             row = await cursor.fetchone()
-            return row[0] if row else None
+            return row[0] if row and row[0] else None
 
-async def remove_vote(chat_id: int, target_date: str, user_id: int):
+async def get_user_vote_record(chat_id: int, target_date: str, user_id: int):
+    """Возвращает детальную информацию о голосе пользователя и счетчике изменений"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("""
+            SELECT status, checked_in, checkin_time, checkout_time, COALESCE(change_count, 0), COALESCE(reason_requested, 0)
+            FROM rollcalls
+            WHERE chat_id = ? AND target_date = ? AND user_id = ?
+        """, (chat_id, target_date, user_id)) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return {
+                    "status": row[0],
+                    "checked_in": row[1],
+                    "checkin_time": row[2],
+                    "checkout_time": row[3],
+                    "change_count": row[4],
+                    "reason_requested": row[5]
+                }
+            return None
+
+async def remove_vote(chat_id: int, target_date: str, user_id: int, increment_change: bool = True):
+    """Снимает отметку пользователя, сохраняя запись и увеличивая счетчик изменений"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            UPDATE rollcalls
+            SET status = NULL,
+                checked_in = 0,
+                checkin_time = NULL,
+                checkout_time = NULL,
+                change_count = CASE WHEN ? THEN COALESCE(change_count, 0) + 1 ELSE COALESCE(change_count, 0) END
+            WHERE chat_id = ? AND target_date = ? AND user_id = ?
+        """, (1 if increment_change else 0, chat_id, target_date, user_id))
+        await db.commit()
+
+async def delete_vote_admin(chat_id: int, target_date: str, user_id: int):
+    """Полное удаление записи голоса администратором"""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             DELETE FROM rollcalls
+            WHERE chat_id = ? AND target_date = ? AND user_id = ?
+        """, (chat_id, target_date, user_id))
+        await db.commit()
+
+async def is_reason_already_requested(chat_id: int, target_date: str, user_id: int) -> bool:
+    """Проверяет, запрашивал ли бот причину у данного пользователя за эту дату"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("""
+            SELECT reason_requested FROM rollcalls
+            WHERE chat_id = ? AND target_date = ? AND user_id = ?
+        """, (chat_id, target_date, user_id)) as cursor:
+            row = await cursor.fetchone()
+            return bool(row and row[0])
+
+async def mark_reason_requested(chat_id: int, target_date: str, user_id: int):
+    """Отмечает, что вопрос о причине неявки уже был отправлен в чат"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            UPDATE rollcalls SET reason_requested = 1
             WHERE chat_id = ? AND target_date = ? AND user_id = ?
         """, (chat_id, target_date, user_id))
         await db.commit()
@@ -244,7 +309,7 @@ async def get_attendance_stats(chat_id: int, month_year: str = None):
         query = """
             SELECT user_id, username, full_name, status, checked_in, target_date
             FROM rollcalls
-            WHERE chat_id = ?
+            WHERE chat_id = ? AND status IS NOT NULL
         """
         params = [chat_id]
         if month_year:
@@ -254,7 +319,7 @@ async def get_attendance_stats(chat_id: int, month_year: str = None):
         async with db.execute(query, tuple(params)) as cursor:
             rows = await cursor.fetchall()
 
-        dates_query = "SELECT DISTINCT target_date FROM rollcalls WHERE chat_id = ?"
+        dates_query = "SELECT DISTINCT target_date FROM rollcalls WHERE chat_id = ? AND status IS NOT NULL"
         dates_params = [chat_id]
         if month_year:
             dates_query += " AND target_date LIKE ?"

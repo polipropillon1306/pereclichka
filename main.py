@@ -5,7 +5,9 @@ from aiogram import Bot, Dispatcher
 from config import BOT_TOKEN
 from db import init_db
 from bot.handlers import router
+from bot.middlewares import ThrottlingMiddleware
 from bot.scheduler import setup_scheduler
+from services.sheets_queue import flush_all_sheet_syncs
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,6 +25,12 @@ async def main():
 
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
+
+    # Подключение Middleware защиты от спама и атак (Throttling)
+    throttling_middleware = ThrottlingMiddleware()
+    dp.callback_query.middleware(throttling_middleware)
+    dp.message.middleware(throttling_middleware)
+
     dp.include_router(router)
 
     # Запуск планировщика
@@ -33,6 +41,7 @@ async def main():
     try:
         await dp.start_polling(bot)
     finally:
+        await flush_all_sheet_syncs()
         await bot.session.close()
 
 if __name__ == "__main__":

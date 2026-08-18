@@ -31,3 +31,9 @@ ALLOWED_CHAT_IDS = [
     int(x.strip()) for x in _raw_allowed if x.strip().lstrip("-").isdigit()
 ]
 
+# Настройки безопасности и лимитов переклички
+MAX_VOTE_CHANGES = int(os.getenv("MAX_VOTE_CHANGES", "3"))  # Макс. количество изменений отметки на один опрос
+RATE_LIMIT_CALLBACK = float(os.getenv("RATE_LIMIT_CALLBACK", "2.0"))  # Минимальный интервал между нажатиями кнопок (сек)
+RATE_LIMIT_MESSAGE = float(os.getenv("RATE_LIMIT_MESSAGE", "1.0"))  # Минимальный интервал между сообщениями/командами (сек)
+SHEETS_SYNC_DEBOUNCE_SECONDS = float(os.getenv("SHEETS_SYNC_DEBOUNCE_SECONDS", "5.0"))  # Задержка дебаунса для записи в Google Таблицу (сек)
+

@@ -13,19 +13,30 @@ from bot.utils import (
     get_current_poll_date_str, format_poll_text, format_stats_text
 )
 from bot.filters import is_admin, is_superadmin
-from config import ALLOWED_CHAT_IDS, DB_PATH, SUPERADMIN_ID
+from config import ALLOWED_CHAT_IDS, DB_PATH, SUPERADMIN_ID, MAX_VOTE_CHANGES
 from db import (
     register_chat, update_chat_sheet, get_chat_sheet,
     save_vote, get_votes_for_date, save_poll_message_id,
     get_poll_message_id, get_target_date_by_message_id, set_checked_in, set_checked_out,
     get_user_vote, remove_vote, get_all_dates_for_chat,
     find_user_by_identifier, get_attendance_stats, get_all_known_users_for_chat,
-    log_private_message, get_private_logs, get_unique_pm_users, clear_private_logs
+    log_private_message, get_private_logs, get_unique_pm_users, clear_private_logs,
+    get_user_vote_record, is_reason_already_requested, mark_reason_requested
 )
 from services.sheets import async_sync_rollcall_to_sheet
+from services.sheets_queue import queue_sheet_sync
 
 router = Router()
 logger = logging.getLogger(__name__)
+
+def is_date_in_past(date_str: str, today_str: str) -> bool:
+    """Проверяет, является ли дата date_str прошедшей относительно today_str"""
+    try:
+        t_dt = datetime.strptime(date_str.strip(), "%d.%m.%Y").date()
+        today_dt = datetime.strptime(today_str.strip(), "%d.%m.%Y").date()
+        return t_dt < today_dt
+    except Exception:
+        return False
 
 class PMLoggingMiddleware(BaseMiddleware):
     async def __call__(
@@ -382,33 +393,35 @@ async def cmd_mark(message: Message):
     # Синхронизация с таблицей
     sheet_url = await get_chat_sheet(message.chat.id)
     if sheet_url:
-        known_users = await get_all_known_users_for_chat(message.chat.id)
-        await async_sync_rollcall_to_sheet(sheet_url, target_date, votes, bot=message.bot, chat_id=message.chat.id, known_users=known_users)
+        await queue_sheet_sync(sheet_url, target_date, message.chat.id, message.bot, delay=1.0)
 
     name_display = f"@{username}" if username else full_name
     await message.answer(f"✅ Для <b>{html.escape(name_display)}</b> на дату <b>{target_date}</b> {action_text}.", parse_mode="HTML")
 
-    # Если утром админ поставил '-' или удалил отметку, бот также запрашивает причину у работника
+    # Если утром админ поставил '-' или удалил отметку, бот также запрашивает причину у работника (с дедупликацией)
     today_date = get_today_date_str(now)
     if target_date == today_date and 6 <= now.hour < 20 and (status == "-" or status == "del"):
-        if status == "-":
-            action_desc = "вас отметили как «Не будет»"
-        else:
-            action_desc = "вашу отметку сняли"
+        already_asked = await is_reason_already_requested(message.chat.id, target_date, user_id)
+        if not already_asked:
+            await mark_reason_requested(message.chat.id, target_date, user_id)
+            if status == "-":
+                action_desc = "вас отметили как «Не будет»"
+            else:
+                action_desc = "вашу отметку сняли"
 
-        user_mention = f"@{username}" if username else f'<a href="tg://user?id={user_id}">{html.escape(full_name or "Участник")}</a>'
-        text_reason = (
-            f"⚠️ {user_mention}, {action_desc} на сегодня ({target_date}).\n"
-            f"Напишите, пожалуйста, причину, почему не сможете прийти?"
-        )
-        try:
-            await message.bot.send_message(
-                chat_id=message.chat.id,
-                text=text_reason,
-                parse_mode="HTML"
+            user_mention = f"@{username}" if username else f'<a href="tg://user?id={user_id}">{html.escape(full_name or "Участник")}</a>'
+            text_reason = (
+                f"⚠️ {user_mention}, {action_desc} на сегодня ({target_date}).\n"
+                f"Напишите, пожалуйста, причину, почему не сможете прийти?"
             )
-        except Exception as e:
-            logger.warning(f"Не удалось отправить запрос причины: {e}")
+            try:
+                await message.bot.send_message(
+                    chat_id=message.chat.id,
+                    text=text_reason,
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logger.warning(f"Не удалось отправить запрос причины: {e}")
 
 @router.message(Command("stats"))
 async def cmd_stats(message: Message):
@@ -558,26 +571,60 @@ async def process_vote_callback(callback: CallbackQuery):
     if not target_date:
         target_date = get_current_poll_date_str()
 
-    prev_status = await get_user_vote(chat_id, target_date, user.id)
-
     now = get_msk_now()
     today_date = get_today_date_str(now)
+
+    # 1. Защита от изменения старых опросов
+    if is_date_in_past(target_date, today_date):
+        await callback.answer("⛔ Опрос за прошлую дату закрыт для голосования.", show_alert=True)
+        return
+
     is_morning_today = (target_date == today_date and 6 <= now.hour < 20)
 
-    # Если нажал ту же кнопку повторно — снимаем голос (кроме утреннего '+' когда подтверждается приход)
-    if prev_status == status:
+    # Получаем полную информацию о текущем статусе пользователя
+    record = await get_user_vote_record(chat_id, target_date, user.id)
+    prev_status = record["status"] if record else None
+    prev_checked_in = record["checked_in"] if record else 0
+    change_count = record["change_count"] if record else 0
+
+    # 2. Защита зафиксированного прихода: если уже подтвердил присутствие утром, нельзя снять отметку через кнопку
+    if prev_status == '+' and prev_checked_in == 1:
+        if status == '-' or (prev_status == status and not is_morning_today):
+            await callback.answer(
+                "⚠️ Ваше присутствие уже зафиксировано в системе.\nСнять или изменить отметку может только администратор командой /mark.",
+                show_alert=True
+            )
+            return
+
+    # 3. Лимит на смену отметки
+    is_same_button = (prev_status == status)
+    is_confirming_morning = (is_same_button and is_morning_today and status == '+')
+
+    if not is_confirming_morning:
+        # Если меняется статус или снимается уже установленный голос
+        if prev_status is not None:
+            if change_count >= MAX_VOTE_CHANGES:
+                await callback.answer(
+                    f"⚠️ Вы исчерпали лимит изменений отметки (макс. {MAX_VOTE_CHANGES} раза).\nДля изменения обратитесь к руководителю.",
+                    show_alert=True
+                )
+                return
+
+    # 4. Обработка голоса
+    if is_same_button:
         if is_morning_today and status == '+':
             checkin_time = now.strftime("%H:%M")
             await set_checked_in(chat_id, target_date, user.id, checkin_time)
             new_status = '+'
             ans_text = f"Ваше присутствие подтверждено ({checkin_time})!"
         else:
-            await remove_vote(chat_id, target_date, user.id)
+            await remove_vote(chat_id, target_date, user.id, increment_change=True)
             new_status = None
             ans_text = "Ваша отметка снята!"
     else:
         checked_in = 1 if (is_morning_today and status == '+') else 0
         checkin_time = now.strftime("%H:%M") if checked_in else None
+        increment = (prev_status is not None)
         await save_vote(
             chat_id=chat_id,
             target_date=target_date,
@@ -586,7 +633,8 @@ async def process_vote_callback(callback: CallbackQuery):
             full_name=user.full_name or "Участник",
             status=status,
             checkin_time=checkin_time,
-            checked_in=checked_in
+            checked_in=checked_in,
+            increment_change=increment
         )
         new_status = status
         ans_text = f"Ваш ответ '{status}' записан!"
@@ -601,15 +649,12 @@ async def process_vote_callback(callback: CallbackQuery):
 
     await callback.answer(ans_text)
 
-    # Синхронизация с Google Sheets
+    # Буферизированная синхронизация с Google Sheets
     sheet_url = await get_chat_sheet(chat_id)
     if sheet_url:
-        known_users = await get_all_known_users_for_chat(chat_id)
-        await async_sync_rollcall_to_sheet(sheet_url, target_date, votes, bot=callback.message.bot, chat_id=chat_id, known_users=known_users)
+        await queue_sheet_sync(sheet_url, target_date, chat_id, callback.message.bot)
 
-    # Если утром снял отметку или изменил на '-', спрашиваем причину
-    now = get_msk_now()
-    today_date = get_today_date_str(now)
+    # Если утром снял отметку или изменил на '-', спрашиваем причину (с дедупликацией)
     if target_date == today_date and 6 <= now.hour < 20:
         action_desc = None
         if new_status == '-':
@@ -626,19 +671,22 @@ async def process_vote_callback(callback: CallbackQuery):
                 action_desc = "сняли отметку"
 
         if action_desc:
-            user_mention = f"@{user.username}" if user.username else f'<a href="tg://user?id={user.id}">{html.escape(user.full_name or "Участник")}</a>'
-            text_reason = (
-                f"⚠️ {user_mention}, вы {action_desc} на сегодня ({target_date}).\n"
-                f"Напишите, пожалуйста, причину, почему не сможете прийти?"
-            )
-            try:
-                await callback.message.bot.send_message(
-                    chat_id=chat_id,
-                    text=text_reason,
-                    parse_mode="HTML"
+            already_asked = await is_reason_already_requested(chat_id, target_date, user.id)
+            if not already_asked:
+                await mark_reason_requested(chat_id, target_date, user.id)
+                user_mention = f"@{user.username}" if user.username else f'<a href="tg://user?id={user.id}">{html.escape(user.full_name or "Участник")}</a>'
+                text_reason = (
+                    f"⚠️ {user_mention}, вы {action_desc} на сегодня ({target_date}).\n"
+                    f"Напишите, пожалуйста, причину, почему не сможете прийти?"
                 )
-            except Exception as e:
-                logger.warning(f"Не удалось отправить запрос причины: {e}")
+                try:
+                    await callback.message.bot.send_message(
+                        chat_id=chat_id,
+                        text=text_reason,
+                        parse_mode="HTML"
+                    )
+                except Exception as e:
+                    logger.warning(f"Не удалось отправить запрос причины: {e}")
 
 @router.message()
 async def handle_messages(message: Message):
@@ -696,8 +744,7 @@ async def handle_messages(message: Message):
 
             sheet_url = await get_chat_sheet(chat_id)
             if sheet_url:
-                known_users = await get_all_known_users_for_chat(chat_id)
-                await async_sync_rollcall_to_sheet(sheet_url, today_date, votes, bot=message.bot, chat_id=chat_id, known_users=known_users)
+                await queue_sheet_sync(sheet_url, today_date, chat_id, message.bot, delay=2.0)
 
     # 2. Фиксация времени ухода со смены (текстом или в подписи к фото)
     clean_text = text.lower().replace("ё", "е").strip("!.,? \n\r")
@@ -749,8 +796,7 @@ async def handle_messages(message: Message):
 
         sheet_url = await get_chat_sheet(chat_id)
         if sheet_url:
-            known_users = await get_all_known_users_for_chat(chat_id)
-            await async_sync_rollcall_to_sheet(sheet_url, today_date, votes, bot=message.bot, chat_id=chat_id, known_users=known_users)
+            await queue_sheet_sync(sheet_url, today_date, chat_id, message.bot, delay=2.0)
         return
 
     # 3. Быстрый ответ + / - / буду / не буду на опрос (текстом или в подписи к фото)
@@ -768,21 +814,50 @@ async def handle_messages(message: Message):
         if not target_date:
             target_date = get_current_poll_date_str(now)
 
-        prev_status = await get_user_vote(chat_id, target_date, user.id)
         today_date = get_today_date_str(now)
+
+        # 1. Защита от изменения старых опросов
+        if is_date_in_past(target_date, today_date):
+            await message.answer("⛔ <b>Опрос за прошлую дату закрыт.</b>", parse_mode="HTML")
+            return
+
         is_morning_today = (target_date == today_date and 6 <= now.hour < 20)
 
-        # Если отправил тот же знак повторно:
-        # Утром (06:00-20:00) отправка '+' подтверждает приход, а НЕ снимает голос!
-        if prev_status == parsed_vote:
+        record = await get_user_vote_record(chat_id, target_date, user.id)
+        prev_status = record["status"] if record else None
+        prev_checked_in = record["checked_in"] if record else 0
+        change_count = record["change_count"] if record else 0
+
+        # 2. Защита зафиксированного прихода
+        if prev_status == '+' and prev_checked_in == 1 and parsed_vote == '-':
+            await message.answer(
+                "⚠️ <b>Ваше присутствие уже зафиксировано в системе.</b>\nИзменить статус может только администратор командой /mark.",
+                parse_mode="HTML"
+            )
+            return
+
+        # 3. Лимит на смену отметки
+        is_same_button = (prev_status == parsed_vote)
+        is_confirming_morning = (is_same_button and is_morning_today and parsed_vote == '+')
+
+        if not is_confirming_morning and prev_status is not None:
+            if change_count >= MAX_VOTE_CHANGES:
+                await message.answer(
+                    f"⚠️ <b>Вы исчерпали лимит изменений отметки (макс. {MAX_VOTE_CHANGES} раза).</b>\nДля изменения обратитесь к руководителю.",
+                    parse_mode="HTML"
+                )
+                return
+
+        if is_same_button:
             if is_morning_today and parsed_vote == '+':
                 new_status = '+'
             else:
-                await remove_vote(chat_id, target_date, user.id)
+                await remove_vote(chat_id, target_date, user.id, increment_change=True)
                 new_status = None
         else:
             checked_in = 1 if (is_morning_today and parsed_vote == '+') else 0
             checkin_time = now.strftime("%H:%M") if checked_in else None
+            increment = (prev_status is not None)
             await save_vote(
                 chat_id=chat_id,
                 target_date=target_date,
@@ -791,7 +866,8 @@ async def handle_messages(message: Message):
                 full_name=user.full_name or "Участник",
                 status=parsed_vote,
                 checkin_time=checkin_time,
-                checked_in=checked_in
+                checked_in=checked_in,
+                increment_change=increment
             )
             new_status = parsed_vote
 
@@ -811,14 +887,12 @@ async def handle_messages(message: Message):
             except Exception as e:
                 logger.warning(f"Не удалось обновить опрос: {e}")
 
-        # Синхронизация с Google Sheets
+        # Синхронизация с Google Sheets через очередь
         sheet_url = await get_chat_sheet(chat_id)
         if sheet_url:
-            known_users = await get_all_known_users_for_chat(chat_id)
-            await async_sync_rollcall_to_sheet(sheet_url, target_date, votes, bot=message.bot, chat_id=chat_id, known_users=known_users)
+            await queue_sheet_sync(sheet_url, target_date, chat_id, message.bot)
 
-        # Если утром снял отметку или изменил на '-', спрашиваем причину
-        today_date = get_today_date_str(now)
+        # Если утром снял отметку или изменил на '-', спрашиваем причину (с дедупликацией)
         if target_date == today_date and 6 <= now.hour < 20:
             action_desc = None
             if new_status == '-':
@@ -835,12 +909,15 @@ async def handle_messages(message: Message):
                     action_desc = "сняли отметку"
 
             if action_desc:
-                user_mention = f"@{user.username}" if user.username else f'<a href="tg://user?id={user.id}">{html.escape(user.full_name or "Участник")}</a>'
-                text_reason = (
-                    f"⚠️ {user_mention}, вы {action_desc} на сегодня ({target_date}).\n"
-                    f"Напишите, пожалуйста, причину, почему не сможете прийти?"
-                )
-                try:
-                    await message.answer(text_reason, parse_mode="HTML")
-                except Exception as e:
-                    logger.warning(f"Не удалось отправить запрос причины: {e}")
+                already_asked = await is_reason_already_requested(chat_id, target_date, user.id)
+                if not already_asked:
+                    await mark_reason_requested(chat_id, target_date, user.id)
+                    user_mention = f"@{user.username}" if user.username else f'<a href="tg://user?id={user.id}">{html.escape(user.full_name or "Участник")}</a>'
+                    text_reason = (
+                        f"⚠️ {user_mention}, вы {action_desc} на сегодня ({target_date}).\n"
+                        f"Напишите, пожалуйста, причину, почему не сможете прийти?"
+                    )
+                    try:
+                        await message.answer(text_reason, parse_mode="HTML")
+                    except Exception as e:
+                        logger.warning(f"Не удалось отправить запрос причины: {e}")
